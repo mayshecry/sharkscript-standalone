@@ -1,4 +1,4 @@
-#Fastest possible count to a million in Sharkscript
+#Slowest possible count to a million in Sharkscript
 # Use ligmashark --compile main.shark to compile it
 
 TIME start
