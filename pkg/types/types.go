@@ -1,6 +1,7 @@
 package types
 
 import (
+	"io"
 	"time"
 )
 
@@ -56,6 +57,7 @@ const (
 	OpIfPost
 	OpIfBreak
 	OpParallelLoop
+	OpSearch
 )
 
 type LogicOp uint8
@@ -122,6 +124,10 @@ type PacketData struct {
 	HTTPHeaders map[string]string
 	HTTPStatus  string
 	HTTPMethod  string
+	Iteration   int
+	Core        int
+	Writer      io.Writer
+	LocalVars   map[string]string
 }
 
 type Plugin interface {

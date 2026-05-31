@@ -13,12 +13,16 @@ import (
 )
 
 func Compile(srcPath string) error {
+	fmt.Println("[Initializing Compiler] - SharkScript")
+	time.Sleep(800 * time.Millisecond)
+
 	src, err := os.Open(srcPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open source file: %w", err)
 	}
 	defer src.Close()
 
+	fmt.Printf("[Parsing Source] - %s\n", srcPath)
 	scanner := bufio.NewScanner(src)
 	lineNum := 0
 
@@ -33,6 +37,13 @@ func Compile(srcPath string) error {
 	}
 	stack := [][]types.Instruction{{}}
 	var ctrlStack []control
+
+	validateVar := func(name string, line int) error {
+		if strings.Contains(name, "%") {
+			return fmt.Errorf("line %d: invalid variable name '%s' (do not use %% in assignments/targets)", line, name)
+		}
+		return nil
+	}
 
 	var compileLogic func(string) *types.LogicExpr
 	compileLogic = func(expr string) *types.LogicExpr {
@@ -75,7 +86,7 @@ func Compile(srcPath string) error {
 		return nil
 	}
 
-	prepare := func(ins *types.Instruction) {
+	prepare := func(ins *types.Instruction) error {
 		if !strings.Contains(ins.Value, "%") && !strings.Contains(ins.Message, "%") {
 			ins.IsStatic = true
 
@@ -91,7 +102,11 @@ func Compile(srcPath string) error {
 		}
 		if ins.Op == types.OpWhile || (ins.Op >= types.OpIfPrint && ins.Op <= types.OpIfBreak) {
 			ins.Condition = compileLogic(ins.Value)
+			if ins.Condition == nil {
+				return fmt.Errorf("invalid condition expression: '%s'", ins.Value)
+			}
 		}
+		return nil
 	}
 
 	for scanner.Scan() {
@@ -139,7 +154,9 @@ func Compile(srcPath string) error {
 				op = types.OpParallelLoop
 			}
 			ins := types.Instruction{Op: op, Value: ctrl.val, Body: body}
-			prepare(&ins)
+			if err := prepare(&ins); err != nil {
+				return fmt.Errorf("line %d: %v", lineNum, err)
+			}
 			stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 			continue
 		}
@@ -159,7 +176,9 @@ func Compile(srcPath string) error {
 			ctrl := ctrlStack[len(ctrlStack)-1]
 			ctrlStack = ctrlStack[:len(ctrlStack)-1]
 			ins := types.Instruction{Op: types.OpWhile, Value: ctrl.val, Body: body}
-			prepare(&ins)
+			if err := prepare(&ins); err != nil {
+				return fmt.Errorf("line %d: %v", lineNum, err)
+			}
 			stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 			continue
 		}
@@ -167,6 +186,9 @@ func Compile(srcPath string) error {
 		if cmd == "FUNCTION" {
 			if len(parts) < 2 {
 				return fmt.Errorf("line %d: FUNCTION requires a name", lineNum)
+			}
+			if _, exists := functions[parts[1]]; exists {
+				return fmt.Errorf("line %d: redeclaration of function '%s'", lineNum, parts[1])
 			}
 			stack = append(stack, []types.Instruction{})
 			ctrlStack = append(ctrlStack, control{op: "FUNCTION", name: parts[1]})
@@ -201,6 +223,9 @@ func Compile(srcPath string) error {
 			if len(parts) < 3 {
 				return fmt.Errorf("line %d: SET requires var and val", lineNum)
 			}
+			if err := validateVar(parts[1], lineNum); err != nil {
+				return err
+			}
 			if parts[2] == "=" {
 				ins.Op = types.OpSetExpr
 				ins.Value = parts[1]
@@ -211,6 +236,7 @@ func Compile(srcPath string) error {
 		case "GET_HEADER":
 			ins.Op, ins.Value, ins.Message = types.OpGetHeader, parts[1], parts[2]
 		case "SET_HEADER":
+			validateVar(parts[1], lineNum)
 			ins.Op, ins.Value, ins.Message = types.OpSetHeader, parts[1], strings.Join(parts[2:], " ")
 		case "TIME":
 			ins.Op, ins.Value = types.OpTime, parts[1]
@@ -235,7 +261,7 @@ func Compile(srcPath string) error {
 			actionIdx := -1
 			for i, p := range parts {
 				u := strings.ToUpper(p)
-				if u == "PRINT" || u == "CALL" || u == "BLOCK" || u == "EXEC" || u == "HTTP" || u == "BREAK" {
+				if u == "PRINT" || u == "CALL" || u == "BLOCK" || u == "EXEC" || u == "HTTP" || u == "BREAK" || u == "INPUT" || u == "SEARCH" {
 					actionIdx = i
 					break
 				}
@@ -260,6 +286,10 @@ func Compile(srcPath string) error {
 					ins.Op = types.OpIfExec
 				case "BREAK":
 					ins.Op = types.OpIfBreak
+				case "INPUT":
+					ins.Op = types.OpInput
+				case "SEARCH":
+					ins.Op = types.OpSearch
 				}
 				ins.Value = strings.Join(parts[1:actionIdx], " ")
 				ins.Message = strings.Join(parts[actionIdx+1:], " ")
@@ -280,10 +310,28 @@ func Compile(srcPath string) error {
 			ins.Op, ins.Value = types.OpSleep, parts[1]
 		case "EXEC":
 			ins.Op, ins.Message = types.OpExec, strings.Join(parts[1:], " ")
+		case "INPUT":
+			if len(parts) >= 2 {
+				if err := validateVar(parts[1], lineNum); err != nil {
+					return err
+				}
+				ins.Op = types.OpInput
+				ins.Value = parts[1]
+				ins.Message = strings.Join(parts[2:], " ")
+			} else {
+				return fmt.Errorf("line %d: INPUT requires a target variable", lineNum)
+			}
 		case "GET_ISP":
 			ins.Op, ins.Value, ins.Message = types.OpGetISP, parts[1], parts[2]
 		case "BLOCK":
 			ins.Op = types.OpBlock
+		case "SEARCH":
+			if len(parts) < 4 {
+				return fmt.Errorf("line %d: SEARCH requires path, target_var and pattern", lineNum)
+			}
+			ins.Op = types.OpSearch
+			ins.Value = parts[2]
+			ins.Message = parts[1] + "|" + strings.Join(parts[3:], " ")
 		case "BASED":
 			ins.Op, ins.Message = types.OpBased, strings.Join(parts[1:], " ")
 		case "SLOP":
@@ -303,14 +351,34 @@ func Compile(srcPath string) error {
 		}
 
 		lastWasIf = currentIsIf
-		prepare(&ins)
+		if err := prepare(&ins); err != nil {
+			return fmt.Errorf("line %d: %v", lineNum, err)
+		}
 		stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed reading source: %w", err)
+	}
+
+	fmt.Println("[Mapping Symbol Table] - SharkScript")
+	time.Sleep(1000 * time.Millisecond)
+
+	fmt.Println("[Checking for Errors] - SharkScript")
+	time.Sleep(1200 * time.Millisecond)
+
+	if len(ctrlStack) > 0 {
+		last := ctrlStack[len(ctrlStack)-1]
+		return fmt.Errorf("syntax error: unclosed block type '%s' (name: %s, val: %s)", last.op, last.name, last.val)
+	}
+
+	fmt.Println("[Optimizing Bytecode] - LIGMA02")
+	time.Sleep(1000 * time.Millisecond)
 
 	destPath := strings.TrimSuffix(srcPath, ".shark") + ".ligma"
 	dest, err := os.Create(destPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer dest.Close()
 
@@ -324,8 +392,20 @@ func Compile(srcPath string) error {
 
 	encoder := gob.NewEncoder(dest)
 	if err := encoder.Encode(script); err != nil {
-		return err
+		return fmt.Errorf("failed to encode bytecode: %w", err)
 	}
+
+	totalInstructions := len(stack[0])
+	for _, fn := range functions {
+		totalInstructions += len(fn)
+	}
+
+	fmt.Printf("\n--- Compilation Successful ---\n")
+	fmt.Printf("Source:       %s\n", srcPath)
+	fmt.Printf("Lines:        %d\n", lineNum)
+	fmt.Printf("Instructions: %d\n", totalInstructions)
+	fmt.Printf("Functions:    %d\n", len(functions))
+	fmt.Printf("Binary Size:  %s\n\n", destPath)
 
 	return nil
 }

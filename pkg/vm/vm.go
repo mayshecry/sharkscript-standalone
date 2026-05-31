@@ -1,28 +1,42 @@
 package vm
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sharkscript/pkg/types"
 )
 
 type Engine struct {
-	Filename     string
-	Instructions []types.Instruction
-	Functions    map[string][]types.Instruction
-	Imports      map[string]bool
-	Vars         map[string]string
-	Headers      map[string]string
-	TimerStart   time.Time
-	mu           sync.RWMutex
+	Filename      string
+	Instructions  []types.Instruction
+	Functions     map[string][]types.Instruction
+	Imports       map[string]bool
+	Vars          map[string]string
+	Headers       map[string]string
+	TimerStart    time.Time
+	mu            sync.RWMutex
+	out           *bufio.Writer
+	outMu         sync.Mutex
+	logPrefix     string
+	corePrefixes  []string
+	basedPrefixes []string
+}
+
+type boundHandler struct {
+	h   instructionHandler
+	ins types.Instruction
 }
 
 func NewEngine(script types.CompiledScript, filename string) *Engine {
@@ -33,23 +47,30 @@ func NewEngine(script types.CompiledScript, filename string) *Engine {
 		Imports:      make(map[string]bool),
 		Vars:         make(map[string]string),
 		Headers:      make(map[string]string),
+		out:          bufio.NewWriterSize(os.Stdout, 128*1024),
+		logPrefix:    "[" + filename + "] ",
 	}
 	for _, imp := range script.Imports {
 		e.Imports[imp] = true
 	}
+
+	e.corePrefixes = make([]string, 129)
+	e.basedPrefixes = make([]string, 129)
+	for i := 0; i < 129; i++ {
+		p := "[" + filename + "] "
+		if i > 0 {
+			p = fmt.Sprintf("[%s] [Core %d] ", filename, i)
+		}
+		e.corePrefixes[i] = p
+		e.basedPrefixes[i] = p + "🗿 BASED: "
+	}
+
 	return e
 }
 
 func (e *Engine) Run(pkt *types.PacketData) {
-	e.mu.Lock()
-	e.Vars["SRC_IP"] = pkt.SrcIP
-	e.Vars["DST_IP"] = pkt.DstIP
-	e.Vars["PROTO"] = pkt.Protocol
-	e.Vars["PROCESS"] = pkt.ProcessName
-	e.Vars["PID"] = fmt.Sprintf("%d", pkt.PID)
-	e.mu.Unlock()
-
 	e.execute(e.Instructions, pkt)
+	e.out.Flush()
 }
 
 type instructionHandler func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool
@@ -76,19 +97,19 @@ func init() {
 		duration := time.Since(e.TimerStart).Seconds()
 		e.mu.RUnlock()
 		e.mu.Lock()
-		e.Vars[ins.Value] = strconv.FormatFloat(duration, 'f', 4, 64)
+		e.Vars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
 		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpSet] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		val := e.expandVars(ins.Message)
+		val := e.expandVars(ins.Message, pkt)
 		e.mu.Lock()
 		e.Vars[ins.Value] = val
 		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpSetExpr] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		val := e.evalMath(e.expandVars(ins.Message))
+		val := e.evalMath(e.expandVars(ins.Message, pkt))
 		e.mu.Lock()
 		e.Vars[ins.Value] = val
 		e.mu.Unlock()
@@ -104,12 +125,19 @@ func init() {
 	}
 	opTable[types.OpLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		if len(ins.Body) == 0 {
+			count := ins.IntValue
+			if !ins.IsStatic {
+				count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
+			}
+			for i := 0; i < count; i++ {
+			}
 			return false
 		}
+		needsIter := e.containsIter(ins.Body)
 
 		dur := ins.Duration
 		if !ins.IsStatic {
-			val := strings.ToLower(e.expandVars(ins.Value))
+			val := strings.ToLower(e.expandVars(ins.Value, pkt))
 			val = strings.ReplaceAll(val, "min", "m")
 			if d, err := time.ParseDuration(val); err == nil {
 				dur = d
@@ -117,7 +145,14 @@ func init() {
 		}
 
 		if dur > 0 {
-			for stop := time.Now().Add(dur); time.Now().Before(stop); {
+			for k := 0; ; k++ {
+				stop := time.Now().Add(dur)
+				if time.Now().After(stop) {
+					break
+				}
+				if needsIter {
+					pkt.Iteration = k
+				}
 				if e.execute(ins.Body, pkt) {
 					return true
 				}
@@ -127,23 +162,49 @@ func init() {
 
 		count := ins.IntValue
 		if !ins.IsStatic {
-			count, _ = strconv.Atoi(e.expandVars(ins.Value))
+			count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
 		}
 		for i := 0; i < count; i++ {
+			if needsIter {
+				pkt.Iteration = i
+			}
 			if e.execute(ins.Body, pkt) {
 				return true
 			}
 		}
+		e.out.Flush()
 		return false
 	}
 	opTable[types.OpParallelLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		if len(ins.Body) == 0 {
+			count := ins.IntValue
+			if !ins.IsStatic {
+				count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
+			}
+			if count <= 0 {
+				return false
+			}
 			return false
 		}
 
+		e.mu.RLock()
+		snapshot := make(map[string]string, len(e.Vars))
+		for k, v := range e.Vars {
+			snapshot[k] = v
+		}
+		e.mu.RUnlock()
+
+		boundBody := make([]boundHandler, len(ins.Body))
+		for i, bIns := range ins.Body {
+			boundBody[i] = boundHandler{h: opTable[bIns.Op], ins: bIns}
+		}
+
+		needsIter := e.containsIter(ins.Body)
+		numWorkers := runtime.GOMAXPROCS(0)
+
 		dur := ins.Duration
 		if !ins.IsStatic {
-			val := strings.ToLower(e.expandVars(ins.Value))
+			val := strings.ToLower(e.expandVars(ins.Value, pkt))
 			val = strings.ReplaceAll(val, "min", "m")
 			if d, err := time.ParseDuration(val); err == nil {
 				dur = d
@@ -151,59 +212,183 @@ func init() {
 		}
 
 		if dur > 0 {
-			numWorkers := runtime.GOMAXPROCS(0)
 			var wg sync.WaitGroup
 			wg.Add(numWorkers)
 			stop := time.Now().Add(dur)
+			buffers := make([]*bytes.Buffer, numWorkers)
+			iterCounts := make([]uint64, numWorkers)
+
 			for w := 0; w < numWorkers; w++ {
-				go func() {
+				buffers[w] = bytes.NewBuffer(make([]byte, 0, 1024*1024))
+				go func(id int, localBuf *bytes.Buffer) {
 					defer wg.Done()
-					for time.Now().Before(stop) {
-						e.execute(ins.Body, pkt)
+					bw := bufio.NewWriterSize(localBuf, 1024*1024)
+					lp := *pkt
+					lp.Core = id + 1
+					lp.Writer = bw
+					lp.LocalVars = snapshot
+					innerLastIf := false
+					var k int
+					for ; ; k++ {
+						if k&0x3F == 0 && time.Now().After(stop) {
+							break
+						}
+						if needsIter {
+							lp.Iteration = k
+						}
+						for _, bh := range boundBody {
+							if bh.h(e, bh.ins, &lp, &innerLastIf) {
+								break
+							}
+						}
 					}
-				}()
+					bw.Flush()
+					iterCounts[id] = uint64(k)
+				}(w, buffers[w])
 			}
 			wg.Wait()
+
+			var totalIterations uint64
+			for _, c := range iterCounts {
+				totalIterations += c
+			}
+
+			e.outMu.Lock()
+			for _, b := range buffers {
+				e.out.Write(b.Bytes())
+			}
+			coreIds := make([]string, numWorkers)
+			for i := 0; i < numWorkers; i++ {
+				coreIds[i] = strconv.Itoa(i + 1)
+			}
+			e.out.WriteString(e.logPrefix)
+			e.out.WriteString("PARALLEL DURATION LOOP COMPLETE: ")
+			e.out.WriteString(strconv.FormatUint(totalIterations, 10))
+			e.out.WriteString(" iterations finished using ")
+			e.out.WriteString(strconv.Itoa(numWorkers))
+			e.out.WriteString(" cores in ")
+			e.out.WriteString(dur.String())
+			e.out.WriteByte('\n')
+			e.outMu.Unlock()
+			e.out.Flush()
 			return false
 		}
 
 		count := ins.IntValue
 		if !ins.IsStatic {
-			count, _ = strconv.Atoi(e.expandVars(ins.Value))
+			count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
 		}
 		if count <= 0 {
 			return false
 		}
-		numWorkers := runtime.NumCPU()
+		if count == 1 {
+			return e.execute(ins.Body, pkt)
+		}
+
 		if count < numWorkers {
 			numWorkers = count
 		}
 
+		startLoop := time.Now()
 		var wg sync.WaitGroup
+		buffers := make([]*bytes.Buffer, numWorkers)
+
 		wg.Add(numWorkers)
 		for w := 0; w < numWorkers; w++ {
-			workerID := w
-			go func() {
+			buffers[w] = bytes.NewBuffer(make([]byte, 0, (count/numWorkers)*64))
+			start := (count * w) / numWorkers
+			end := (count * (w + 1)) / numWorkers
+			go func(s, n, id int, localBuf *bytes.Buffer) {
 				defer wg.Done()
-				start, end := (count*workerID)/numWorkers, (count*(workerID+1))/numWorkers
-				for i := start; i < end; i++ {
-					e.execute(ins.Body, pkt)
+				bw := bufio.NewWriterSize(localBuf, 1024*1024)
+				lp := *pkt
+				lp.Core = id + 1
+				lp.Writer = bw
+				lp.LocalVars = snapshot
+				innerLastIf := false
+				for i := s; i < n; i++ {
+					if needsIter {
+						lp.Iteration = i
+					}
+					for _, bh := range boundBody {
+						if bh.h(e, bh.ins, &lp, &innerLastIf) {
+							break
+						}
+					}
 				}
-			}()
+				bw.Flush()
+			}(start, end, w, buffers[w])
 		}
 		wg.Wait()
+		elapsed := time.Since(startLoop)
+
+		e.outMu.Lock()
+		for _, b := range buffers {
+			e.out.Write(b.Bytes())
+		}
+
+		coreIds := make([]string, numWorkers)
+		for i := 0; i < numWorkers; i++ {
+			coreIds[i] = strconv.Itoa(i + 1)
+		}
+
+		e.out.WriteString(e.logPrefix)
+		e.out.WriteString("PARALLEL LOOP COMPLETE: ")
+		e.out.WriteString(strconv.Itoa(count))
+		e.out.WriteString(" iterations finished using ")
+		e.out.WriteString(strconv.Itoa(numWorkers))
+		e.out.WriteString(" cores in ")
+		e.out.WriteString(elapsed.String())
+		e.out.WriteByte('\n')
+		e.outMu.Unlock()
+
+		e.out.Flush()
 		return false
 	}
 	opTable[types.OpPrint] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		fmt.Printf("[%s] %s\n", e.Filename, e.expandVars(ins.Message))
+		msg := e.expandVars(ins.Message, pkt)
+		idx := 0
+		if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+			idx = pkt.Core
+		}
+
+		if pkt != nil && pkt.Writer != nil {
+			pkt.Writer.Write([]byte(e.corePrefixes[idx]))
+			pkt.Writer.Write([]byte(msg))
+			pkt.Writer.Write([]byte{'\n'})
+			return false
+		}
+
+		e.outMu.Lock()
+		e.out.WriteString(e.corePrefixes[idx])
+		e.out.WriteString(msg)
+		e.out.WriteByte('\n')
+		e.outMu.Unlock()
 		return false
 	}
 	opTable[types.OpBased] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		fmt.Printf("[%s] 🗿 BASED: %s\n", e.Filename, e.expandVars(ins.Message))
+		msg := e.expandVars(ins.Message, pkt)
+		idx := 0
+		if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+			idx = pkt.Core
+		}
+
+		if pkt != nil && pkt.Writer != nil {
+			pkt.Writer.Write([]byte(e.basedPrefixes[idx]))
+			pkt.Writer.Write([]byte(msg))
+			pkt.Writer.Write([]byte{'\n'})
+			return false
+		}
+
+		e.outMu.Lock()
+		e.out.WriteString(e.basedPrefixes[idx])
+		e.out.WriteString(msg)
+		e.out.WriteByte('\n')
+		e.outMu.Unlock()
 		return false
 	}
 	opTable[types.OpExec] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		expanded := e.expandVars(ins.Message)
+		expanded := e.expandVars(ins.Message, pkt)
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
 			cmd = exec.Command("cmd", "/C", expanded)
@@ -216,18 +401,18 @@ func init() {
 	opTable[types.OpTime] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		e.mu.Lock()
 		ms := float64(time.Now().UnixNano()) / 1e6
-		e.Vars[ins.Value] = strconv.FormatFloat(ms, 'f', 4, 64)
+		e.Vars[ins.Value] = strconv.FormatFloat(ms, 'f', 9, 64)
 		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpSleep] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		if ms, err := strconv.Atoi(e.expandVars(ins.Value)); err == nil {
+		if ms, err := strconv.Atoi(e.expandVars(ins.Value, pkt)); err == nil {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 		return false
 	}
 	opTable[types.OpLog] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		msg := e.expandVars(ins.Message)
+		msg := e.expandVars(ins.Message, pkt)
 		f, err := os.OpenFile("shark.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err == nil {
 			fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
@@ -238,7 +423,24 @@ func init() {
 	opTable[types.OpIfPrint] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		if e.evalLogic(ins.Condition, pkt) {
 			*lastIfMet = true
-			fmt.Printf("[%s] %s\n", e.Filename, e.expandVars(ins.Message))
+			msg := e.expandVars(ins.Message, pkt)
+			idx := 0
+			if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+				idx = pkt.Core
+			}
+
+			if pkt != nil && pkt.Writer != nil {
+				pkt.Writer.Write([]byte(e.corePrefixes[idx]))
+				pkt.Writer.Write([]byte(msg))
+				pkt.Writer.Write([]byte{'\n'})
+				return false
+			}
+
+			e.outMu.Lock()
+			e.out.WriteString(e.corePrefixes[idx])
+			e.out.WriteString(msg)
+			e.out.WriteByte('\n')
+			e.outMu.Unlock()
 		} else {
 			*lastIfMet = false
 		}
@@ -254,6 +456,83 @@ func init() {
 		if f, ok := e.Functions[ins.Value]; ok {
 			return e.execute(f, pkt)
 		}
+		return false
+	}
+	opTable[types.OpSearch] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		targetVar := ins.Value
+		msgParts := strings.SplitN(ins.Message, "|", 2)
+		if len(msgParts) < 2 {
+			return false
+		}
+		pathPattern := e.expandVars(msgParts[0], pkt)
+		searchTerm := strings.TrimSpace(e.expandVars(msgParts[1], pkt))
+		searchBytes := []byte(searchTerm)
+
+		files, _ := filepath.Glob(pathPattern)
+		if len(files) == 0 {
+			e.mu.Lock()
+			e.Vars[targetVar] = "0"
+			e.mu.Unlock()
+			return false
+		}
+
+		var outputMu sync.Mutex
+
+		searchInFile := func(fileName string, pattern []byte) int64 {
+			f, err := os.Open(fileName)
+			if err != nil {
+				return 0
+			}
+			defer f.Close()
+
+			var localCount int64
+			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.Contains(line, string(pattern)) {
+					localCount++
+					outputMu.Lock()
+					fmt.Printf("\033[32m[FOUND]\033[0m %s: %s\n", fileName, line)
+					outputMu.Unlock()
+				}
+			}
+			return localCount
+		}
+
+		var count int64
+		if len(files) == 1 {
+			count = searchInFile(files[0], searchBytes)
+		} else {
+			var wg sync.WaitGroup
+			numWorkers := runtime.NumCPU()
+			if numWorkers > len(files) {
+				numWorkers = len(files)
+			}
+
+			workChan := make(chan string, len(files))
+			for _, f := range files {
+				workChan <- f
+			}
+			close(workChan)
+
+			wg.Add(numWorkers)
+			for i := 0; i < numWorkers; i++ {
+				go func() {
+					defer wg.Done()
+					for f := range workChan {
+						c := searchInFile(f, searchBytes)
+						atomic.AddInt64(&count, c)
+					}
+				}()
+			}
+			wg.Wait()
+		}
+
+		e.mu.Lock()
+		e.Vars[targetVar] = strconv.FormatInt(count, 10)
+		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpBreak] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -285,16 +564,44 @@ func (e *Engine) execute(insts []types.Instruction, pkt *types.PacketData) bool 
 }
 
 func (e *Engine) handleElseAction(ins types.Instruction, pkt *types.PacketData) bool {
-	msg := e.expandVars(ins.Message)
+	msg := e.expandVars(ins.Message, pkt)
 	switch ins.Value {
 	case "ELSE_PRINT":
-		fmt.Printf("[%s] %s\n", e.Filename, msg)
+		idx := 0
+		if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+			idx = pkt.Core
+		}
+
+		if pkt != nil && pkt.Writer != nil {
+			pkt.Writer.Write([]byte(e.corePrefixes[idx]))
+			pkt.Writer.Write([]byte(msg))
+			pkt.Writer.Write([]byte{'\n'})
+			return false
+		}
+
+		e.outMu.Lock()
+		e.out.WriteString(e.corePrefixes[idx])
+		e.out.WriteString(msg)
+		e.out.WriteByte('\n')
+		e.outMu.Unlock()
 	case "ELSE_CALL":
 		if f, ok := e.Functions[msg]; ok {
 			return e.execute(f, pkt)
 		}
 	case "ELSE_BLOCK":
 		e.killProcess(pkt)
+	}
+	return false
+}
+
+func (e *Engine) containsIter(insts []types.Instruction) bool {
+	for _, ins := range insts {
+		if strings.Contains(ins.Message, "%ITER%") || strings.Contains(ins.Value, "%ITER%") {
+			return true
+		}
+		if len(ins.Body) > 0 && e.containsIter(ins.Body) {
+			return true
+		}
 	}
 	return false
 }
@@ -334,7 +641,7 @@ func (e *Engine) resolveOperand(expr *types.LogicExpr) string {
 		return expr.Value
 	}
 	if expr.Op == types.LogVar {
-		return e.expandVars("%" + expr.Value + "%")
+		return e.expandVars("%"+expr.Value+"%", nil)
 	}
 	return ""
 }
@@ -389,7 +696,7 @@ func (e *Engine) evalMath(expr string) string {
 			} else if right != 0 {
 				res = left / right
 			}
-			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 4, 64)
+			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 9, 64)
 		} else {
 			highPrec = append(highPrec, t)
 		}
@@ -412,12 +719,14 @@ func (e *Engine) evalMath(expr string) string {
 		}
 	}
 
-	return strconv.FormatFloat(total, 'f', 4, 64)
+	return strconv.FormatFloat(total, 'f', 9, 64)
 }
 
-func (e *Engine) expandVars(input string) string {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
+	if !strings.Contains(input, "%") {
+		return input
+	}
+
 	var sb strings.Builder
 	curr := input
 	for {
@@ -435,10 +744,78 @@ func (e *Engine) expandVars(input string) string {
 			break
 		}
 		key := curr[:end]
-		if val, ok := e.Vars[key]; ok {
-			sb.WriteString(val)
-		} else {
-			sb.WriteString("%" + key + "%")
+
+		handled := false
+		if pkt != nil {
+			switch key {
+			case "ITER":
+				var b [20]byte
+				sb.Write(strconv.AppendInt(b[:0], int64(pkt.Iteration), 10))
+				handled = true
+			case "CORE":
+				var b [20]byte
+				sb.Write(strconv.AppendInt(b[:0], int64(pkt.Core), 10))
+				handled = true
+			case "SRC_IP":
+				sb.WriteString(pkt.SrcIP)
+				handled = true
+			case "DST_IP":
+				sb.WriteString(pkt.DstIP)
+				handled = true
+			case "PROTO":
+				sb.WriteString(pkt.Protocol)
+				handled = true
+			case "PROCESS":
+				sb.WriteString(pkt.ProcessName)
+				handled = true
+			case "PID":
+				var b [20]byte
+				sb.Write(strconv.AppendInt(b[:0], int64(pkt.PID), 10))
+				handled = true
+			}
+		}
+
+		if !handled {
+			var val string
+			var ok bool
+			if pkt != nil && pkt.LocalVars != nil {
+				val, ok = pkt.LocalVars[key]
+			} else {
+				e.mu.RLock()
+				val, ok = e.Vars[key]
+				e.mu.RUnlock()
+			}
+
+			if !ok {
+				sb.WriteString("%" + key + "%")
+			} else {
+				f, err := strconv.ParseFloat(val, 64)
+				if err == nil && f > 0 && f < 1 {
+					if strings.HasPrefix(curr[end+1:], "ms") {
+						if f < 0.001 {
+							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64) + " nanoseconds")
+						} else {
+							sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64) + " microseconds")
+						}
+						curr = curr[end+3:]
+						continue
+					} else if strings.HasPrefix(curr[end+1:], "s") {
+						next := curr[end+1:]
+						if len(next) == 1 || next[1] == ' ' || next[1] == '\n' || next[1] == '\t' || next[1] == '.' || next[1] == ',' {
+							if f < 0.000001 {
+								sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64) + " nanoseconds")
+							} else if f < 0.001 {
+								sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64) + " microseconds")
+							} else {
+								sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64) + " ms")
+							}
+							curr = curr[end+2:]
+							continue
+						}
+					}
+				}
+				sb.WriteString(val)
+			}
 		}
 		curr = curr[end+1:]
 	}

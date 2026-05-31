@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"sharkscript/pkg/compiler"
@@ -52,6 +53,14 @@ func main() {
 		}
 
 		engine := vm.NewEngine(script, file)
+
+		for i := 3; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			if strings.HasPrefix(arg, "--") && strings.Contains(arg, "=") {
+				kv := strings.SplitN(arg[2:], "=", 2)
+				engine.Vars[kv[0]] = kv[1]
+			}
+		}
 
 		pkt := &types.PacketData{
 			Timestamp:   time.Now(),
