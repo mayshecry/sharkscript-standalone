@@ -1,0 +1,6 @@
+TIME start
+PARALLEL LOOP 1000000
+    print Iteration: %ITER%
+ENDLOOP
+TIME end
+SET duration = %end% - %start%
