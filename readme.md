@@ -4,7 +4,7 @@ SharkScript is a high-performance, domain-specific scripting language designed f
 
 ## Features
 
-- **Custom Bytecode**: Compiles `.shark` source into optimized `.ligma` (LIGMA02) bytecode.
+- **Custom Bytecode**: Compiles `.shark` source into optimized `.shx` (shx02) bytecode.
 - **Parallel Execution**: Native support for multi-threaded loops using `PARALLEL LOOP`.
 - **High-Precision Math**: Support for floating-point arithmetic with operator precedence (+, -, *, /).
 - **Logic Engine**: Complex boolean logic evaluation (AND/OR) with packet-specific primitives.
@@ -29,7 +29,7 @@ shs --compile examples/benchmark.shark
 
 ### Running a script
 ```bash
-shs --run examples/benchmark.ligma
+shs --run examples/benchmark.shx
 ```
 
 ## Language Syntax
