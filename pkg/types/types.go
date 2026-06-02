@@ -22,11 +22,11 @@ const (
 	OpIncrement
 	OpLoop
 	OpWhile
-	OpBased
-	OpSlop
+	OpSystem
+	OpData
 	OpTelemetry
-	OpHate
-	OpRejectMS
+	OpFilter
+	OpReject
 	OpBashKill
 	OpNuke
 	OpDropAll
@@ -58,6 +58,12 @@ const (
 	OpIfBreak
 	OpParallelLoop
 	OpSearch
+	OpReadFile
+	OpTokenize
+	OpArrayGet
+	OpArraySet
+	OpArrayLen
+	OpIndexOf
 )
 
 type LogicOp uint8

@@ -332,10 +332,40 @@ func Compile(srcPath string) error {
 			ins.Op = types.OpSearch
 			ins.Value = parts[2]
 			ins.Message = parts[1] + "|" + strings.Join(parts[3:], " ")
-		case "BASED":
-			ins.Op, ins.Message = types.OpBased, strings.Join(parts[1:], " ")
-		case "SLOP":
-			ins.Op, ins.Message = types.OpSlop, strings.Join(parts[1:], " ")
+		case "READ_FILE":
+			if len(parts) < 3 {
+				return fmt.Errorf("line %d: READ_FILE requires path and target_var", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpReadFile, parts[1], parts[2]
+		case "TOKENIZE":
+			if len(parts) < 4 {
+				return fmt.Errorf("line %d: TOKENIZE requires source, delimiter, and target_array", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpTokenize, parts[1], parts[2]+"|"+parts[3]
+		case "ARRAY_GET":
+			if len(parts) < 4 {
+				return fmt.Errorf("line %d: ARRAY_GET requires array, index, and target_var", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpArrayGet, parts[1], parts[2]+"|"+parts[3]
+		case "ARRAY_SET":
+			if len(parts) < 4 {
+				return fmt.Errorf("line %d: ARRAY_SET requires array, index, and value", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpArraySet, parts[1], parts[2]+"|"+strings.Join(parts[3:], " ")
+		case "ARRAY_LEN":
+			if len(parts) < 3 {
+				return fmt.Errorf("line %d: ARRAY_LEN requires array and target_var", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpArrayLen, parts[1], parts[2]
+		case "INDEX_OF":
+			if len(parts) < 4 {
+				return fmt.Errorf("line %d: INDEX_OF requires source, search_term, and target_var", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpIndexOf, parts[1], parts[2]+"|"+parts[3]
+		case "SYSTEM":
+			ins.Op, ins.Message = types.OpSystem, strings.Join(parts[1:], " ")
+		case "RAW":
+			ins.Op, ins.Message = types.OpData, strings.Join(parts[1:], " ")
 		case "REDIRECT":
 			ins.Op, ins.Value = types.OpRedirect, parts[2]
 		case "SPOOF":
@@ -372,17 +402,17 @@ func Compile(srcPath string) error {
 		return fmt.Errorf("syntax error: unclosed block type '%s' (name: %s, val: %s)", last.op, last.name, last.val)
 	}
 
-	fmt.Println("[Optimizing Bytecode] - LIGMA02")
+	fmt.Println("[Optimizing Bytecode] - SHARK01")
 	time.Sleep(1000 * time.Millisecond)
 
-	destPath := strings.TrimSuffix(srcPath, ".shark") + ".ligma"
+	destPath := strings.TrimSuffix(srcPath, ".shark") + ".shx"
 	dest, err := os.Create(destPath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer dest.Close()
 
-	dest.Write([]byte("LIGMA02"))
+	dest.Write([]byte("SHARK01"))
 
 	script := types.CompiledScript{
 		Main:      stack[0],

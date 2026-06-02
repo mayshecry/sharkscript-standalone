@@ -15,7 +15,7 @@ import (
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Usage: sharkscript --compile <file.shark>")
-		fmt.Println("       sharkscript --run <file.ligma>")
+		fmt.Println("       sharkscript --run <file.shx>")
 		os.Exit(1)
 	}
 
@@ -41,7 +41,7 @@ func main() {
 
 		header := make([]byte, 7)
 		f.Read(header)
-		if string(header) != "LIGMA02" {
+		if string(header) != "SHARK01" {
 			fmt.Println("Invalid bytecode format.")
 			os.Exit(1)
 		}

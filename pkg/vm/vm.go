@@ -19,19 +19,20 @@ import (
 )
 
 type Engine struct {
-	Filename      string
-	Instructions  []types.Instruction
-	Functions     map[string][]types.Instruction
-	Imports       map[string]bool
-	Vars          map[string]string
-	Headers       map[string]string
-	TimerStart    time.Time
-	mu            sync.RWMutex
-	out           *bufio.Writer
-	outMu         sync.Mutex
-	logPrefix     string
-	corePrefixes  []string
-	basedPrefixes []string
+	Filename       string
+	Instructions   []types.Instruction
+	Functions      map[string][]types.Instruction
+	Imports        map[string]bool
+	Vars           map[string]string
+	Arrays         map[string][]string
+	Headers        map[string]string
+	TimerStart     time.Time
+	mu             sync.RWMutex
+	out            *bufio.Writer
+	outMu          sync.Mutex
+	logPrefix      string
+	corePrefixes   []string
+	systemPrefixes []string
 }
 
 type boundHandler struct {
@@ -46,6 +47,7 @@ func NewEngine(script types.CompiledScript, filename string) *Engine {
 		Functions:    script.Functions,
 		Imports:      make(map[string]bool),
 		Vars:         make(map[string]string),
+		Arrays:       make(map[string][]string),
 		Headers:      make(map[string]string),
 		out:          bufio.NewWriterSize(os.Stdout, 128*1024),
 		logPrefix:    "[" + filename + "] ",
@@ -55,14 +57,14 @@ func NewEngine(script types.CompiledScript, filename string) *Engine {
 	}
 
 	e.corePrefixes = make([]string, 129)
-	e.basedPrefixes = make([]string, 129)
+	e.systemPrefixes = make([]string, 129)
 	for i := 0; i < 129; i++ {
 		p := "[" + filename + "] "
 		if i > 0 {
 			p = fmt.Sprintf("[%s] [Core %d] ", filename, i)
 		}
 		e.corePrefixes[i] = p
-		e.basedPrefixes[i] = p + "🗿 BASED: "
+		e.systemPrefixes[i] = p + "[SYSTEM] "
 	}
 
 	return e
@@ -366,7 +368,7 @@ func init() {
 		e.outMu.Unlock()
 		return false
 	}
-	opTable[types.OpBased] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+	opTable[types.OpSystem] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		msg := e.expandVars(ins.Message, pkt)
 		idx := 0
 		if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
@@ -374,14 +376,14 @@ func init() {
 		}
 
 		if pkt != nil && pkt.Writer != nil {
-			pkt.Writer.Write([]byte(e.basedPrefixes[idx]))
+			pkt.Writer.Write([]byte(e.systemPrefixes[idx]))
 			pkt.Writer.Write([]byte(msg))
 			pkt.Writer.Write([]byte{'\n'})
 			return false
 		}
 
 		e.outMu.Lock()
-		e.out.WriteString(e.basedPrefixes[idx])
+		e.out.WriteString(e.systemPrefixes[idx])
 		e.out.WriteString(msg)
 		e.out.WriteByte('\n')
 		e.outMu.Unlock()
@@ -545,6 +547,96 @@ func init() {
 	opTable[types.OpBlock] = killHandler
 	opTable[types.OpNuke] = killHandler
 	opTable[types.OpBashKill] = killHandler
+
+	opTable[types.OpReadFile] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		path := e.expandVars(ins.Value, pkt)
+		data, err := os.ReadFile(path)
+		e.mu.Lock()
+		if err != nil {
+			e.Vars[ins.Message] = "ERR:FILE_NOT_FOUND"
+		} else {
+			e.Vars[ins.Message] = string(data)
+		}
+		e.mu.Unlock()
+		return false
+	}
+	opTable[types.OpTokenize] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		src := e.expandVars(ins.Value, pkt)
+		mParts := strings.SplitN(ins.Message, "|", 2)
+		delim := e.expandVars(mParts[0], pkt)
+		arrayName := mParts[1]
+
+		var tokens []string
+		if delim == "SPACE" {
+			tokens = strings.Fields(src)
+		} else if delim == "NEWLINE" {
+			tokens = strings.Split(src, "\n")
+		} else {
+			tokens = strings.Split(src, delim)
+		}
+
+		e.mu.Lock()
+		e.Arrays[arrayName] = tokens
+		e.mu.Unlock()
+		return false
+	}
+	opTable[types.OpArrayGet] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		mParts := strings.SplitN(ins.Message, "|", 2)
+		idx, _ := strconv.Atoi(e.expandVars(mParts[0], pkt))
+		target := mParts[1]
+
+		e.mu.RLock()
+		arr := e.Arrays[ins.Value]
+		val := ""
+		if idx >= 0 && idx < len(arr) {
+			val = arr[idx]
+		}
+		e.mu.RUnlock()
+
+		e.mu.Lock()
+		e.Vars[target] = val
+		e.mu.Unlock()
+		return false
+	}
+	opTable[types.OpArraySet] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		mParts := strings.SplitN(ins.Message, "|", 2)
+		idx, _ := strconv.Atoi(e.expandVars(mParts[0], pkt))
+		val := e.expandVars(mParts[1], pkt)
+
+		e.mu.Lock()
+		if _, ok := e.Arrays[ins.Value]; !ok {
+			e.Arrays[ins.Value] = make([]string, idx+1)
+		}
+		if idx >= len(e.Arrays[ins.Value]) {
+			newArr := make([]string, idx+1)
+			copy(newArr, e.Arrays[ins.Value])
+			e.Arrays[ins.Value] = newArr
+		}
+		e.Arrays[ins.Value][idx] = val
+		e.mu.Unlock()
+		return false
+	}
+	opTable[types.OpArrayLen] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		e.mu.RLock()
+		length := len(e.Arrays[ins.Value])
+		e.mu.RUnlock()
+		e.mu.Lock()
+		e.Vars[ins.Message] = strconv.Itoa(length)
+		e.mu.Unlock()
+		return false
+	}
+	opTable[types.OpIndexOf] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		src := e.expandVars(ins.Value, pkt)
+		mParts := strings.SplitN(ins.Message, "|", 2)
+		search := e.expandVars(mParts[0], pkt)
+		target := mParts[1]
+
+		idx := strings.Index(src, search)
+		e.mu.Lock()
+		e.Vars[target] = strconv.Itoa(idx)
+		e.mu.Unlock()
+		return false
+	}
 }
 
 func (e *Engine) execute(insts []types.Instruction, pkt *types.PacketData) bool {
