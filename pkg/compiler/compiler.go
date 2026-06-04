@@ -761,7 +761,7 @@ func translateToGo(ins types.Instruction, depth int) string {
 				default:
 					fmt.Fprintf(&expansion, "%sif v, ok := vars[%q]; ok { %s.WriteString(v) } else { %s.WriteString(\"%%%s%%\") }\n",
 						indent, p, targetWriter, targetWriter, p)
-				}
+				} // How sinister
 			}
 		}
 		return expansion.String()
