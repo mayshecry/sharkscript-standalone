@@ -15,7 +15,7 @@ import (
 )
 
 func Compile(srcPath string) error {
-	fmt.Printf("🏗️  Initializing Build: %s\n", srcPath)
+	fmt.Printf(" Initializing Build: %s\n", srcPath)
 
 	script, lineNum, err := Parse(srcPath)
 	if err != nil {
