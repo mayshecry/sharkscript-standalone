@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -13,14 +14,37 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: sharkscript --compile <file.shark>")
-		fmt.Println("       sharkscript --run <file.shx>")
+	if len(os.Args) < 2 {
+		fmt.Println("SharkScript CLI")
+		fmt.Println("Usage:")
+		fmt.Println("  shs <file.shark>          Compile to .shx")
+		fmt.Println("  shs <file.shx>            Execute bytecode")
+		fmt.Println("  shs --compile <file.shark>")
+		fmt.Println("  shs --run <file.shx>")
+		fmt.Println("  shs --aot <file.shark> [-os <target_os>]")
 		os.Exit(1)
 	}
 
-	mode := os.Args[1]
-	file := os.Args[2]
+	var mode, file string
+	var extraArgsStart int
+
+	if strings.HasPrefix(os.Args[1], "--") {
+		if len(os.Args) < 3 {
+			fmt.Printf("Error: %s requires a file path\n", os.Args[1])
+			os.Exit(1)
+		}
+		mode = os.Args[1]
+		file = os.Args[2]
+		extraArgsStart = 3
+	} else {
+		file = os.Args[1]
+		extraArgsStart = 2
+		if strings.HasSuffix(file, ".shark") {
+			mode = "--compile"
+		} else {
+			mode = "--run"
+		}
+	}
 
 	switch mode {
 	case "--compile":
@@ -30,6 +54,20 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("Compiled %s successfully.\n", file)
+
+	case "--aot":
+		targetOS := runtime.GOOS
+		for i := 1; i < len(os.Args); i++ {
+			if os.Args[i] == "-os" && i+1 < len(os.Args) {
+				targetOS = os.Args[i+1]
+			}
+		}
+		err := compiler.CompileAOT(file, targetOS)
+		if err != nil {
+			fmt.Printf("AOT Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("AOT Build complete.\n")
 
 	case "--run":
 		f, err := os.Open(file)
@@ -54,7 +92,7 @@ func main() {
 
 		engine := vm.NewEngine(script, file)
 
-		for i := 3; i < len(os.Args); i++ {
+		for i := extraArgsStart; i < len(os.Args); i++ {
 			arg := os.Args[i]
 			if strings.HasPrefix(arg, "--") && strings.Contains(arg, "=") {
 				kv := strings.SplitN(arg[2:], "=", 2)

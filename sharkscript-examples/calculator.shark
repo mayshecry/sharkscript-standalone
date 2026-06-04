@@ -1,0 +1,50 @@
+# SharkScript Calculator Utility
+# Built using the SHARK01 instruction set
+
+SET active 1
+
+FUNCTION do_add
+    SET res = %val1% + %val2%
+    PRINT ">> Result: %res%"
+ENDFUNCTION
+
+FUNCTION do_sub
+    SET res = %val1% - %val2%
+    PRINT ">> Result: %res%"
+ENDFUNCTION
+
+FUNCTION do_mul
+    SET res = %val1% * %val2%
+    PRINT ">> Result: %res%"
+ENDFUNCTION
+
+FUNCTION do_div
+    SET res = %val1% / %val2%
+    PRINT ">> Result: %res%"
+ENDFUNCTION
+
+WHILE %active% == 1
+    PRINT "---------------------------"
+    PRINT " SharkScript Calculator    "
+    PRINT "---------------------------"
+    PRINT " 1. Add (+)"
+    PRINT " 2. Subtract (-)"
+    PRINT " 3. Multiply (*)"
+    PRINT " 4. Divide (/)"
+    PRINT " 5. Exit"
+    PRINT ""
+
+    INPUT choice "Select an operation: "
+
+    IF %choice% == 5 BREAK
+
+    INPUT val1 "Enter first number: "
+    INPUT val2 "Enter second number: "
+
+    IF %choice% == 1 CALL do_add
+    IF %choice% == 2 CALL do_sub
+    IF %choice% == 3 CALL do_mul
+    IF %choice% == 4 CALL do_div
+ENDWHILE
+
+PRINT "Shutting down calculator..."

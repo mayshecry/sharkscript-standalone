@@ -1,6 +1,6 @@
-TIME start
+TIMER_START
 PARALLEL LOOP 1000000
-    print Iteration: %ITER%
+    PRINT .
 ENDLOOP
-TIME end
-SET duration = %end% - %start%
+TIMER_END duration
+PRINT Benchmarking finished in %duration%ns

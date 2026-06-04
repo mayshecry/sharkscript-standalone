@@ -57,6 +57,7 @@ const (
 	OpIfPost
 	OpIfBreak
 	OpParallelLoop
+	OpEmptyParallelLoop
 	OpSearch
 	OpReadFile
 	OpTokenize
@@ -92,21 +93,27 @@ type LogicExpr struct {
 }
 
 type Instruction struct {
-	Op        OpCode
-	Value     string
-	Message   string
-	Body      []Instruction
-	Condition *LogicExpr
-	IntValue  int
-	IsStatic  bool
-	Duration  time.Duration
+	Op                OpCode
+	Value             string
+	Message           string
+	Body              []Instruction
+	Condition         *LogicExpr
+	IntValue          int
+	IsStatic          bool
+	Duration          time.Duration
+	NeedsIteration    bool
+	IsSinglePrintLoop bool
+	Precomputed       [][]byte
+	TemplateParts     []string
+	RuntimeState      any
 }
 
 type CompiledScript struct {
-	Main      []Instruction
-	Functions map[string][]Instruction
-	Imports   []string
-	Symbols   []string
+	Main           []Instruction
+	Functions      map[string][]Instruction
+	Imports        []string
+	Symbols        []string
+	UsesBypassTime bool
 }
 
 type PacketData struct {

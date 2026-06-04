@@ -1,0 +1,96 @@
+# ========================================================
+# SHARKSCRIPT BRAINFUCK INTERPRETER
+# Architecture: SHARK01 
+# Author: Val / mayshecry
+# ========================================================
+
+# 1. Initialize System State
+SET ptr = 0
+SET pc = 0
+ARRAY_SET mem 0 0
+
+# 2. Load and Tokenize Source
+READ_FILE "examples/program.bf" raw_code
+TOKENIZE %raw_code% "" tokens
+ARRAY_LEN tokens code_len
+
+PRINT [SYSTEM] Loaded %code_len% instructions. Starting VM...
+
+# 3. Define Instruction Handlers
+FUNCTION bf_inc
+    ARRAY_GET mem %ptr% val
+    SET val = %val% + 1
+    ARRAY_SET mem %ptr% %val%
+ENDFUNCTION
+
+FUNCTION bf_dec
+    ARRAY_GET mem %ptr% val
+    SET val = %val% - 1
+    ARRAY_SET mem %ptr% %val%
+ENDFUNCTION
+
+FUNCTION bf_right
+    INCREMENT ptr
+    ARRAY_GET mem %ptr% exists
+    IF %exists% == "" ARRAY_SET mem %ptr% 0
+ENDFUNCTION
+
+FUNCTION bf_left
+    SET ptr = %ptr% - 1
+ENDFUNCTION
+
+FUNCTION bf_output
+    ARRAY_GET mem %ptr% val
+    # In this simple version, we print the raw value
+    PRINT %val%
+ENDFUNCTION
+
+FUNCTION bf_jump_fwd
+    ARRAY_GET mem %ptr% val
+    IF %val% == 0 CALL bf_scan_fwd
+ENDFUNCTION
+
+FUNCTION bf_scan_fwd
+    SET depth = 1
+    WHILE %depth% > 0
+        INCREMENT pc
+        ARRAY_GET tokens %pc% look
+        IF %look% == "[" SET depth = %depth% + 1
+        IF %look% == "]" SET depth = %depth% - 1
+    ENDWHILE
+ENDFUNCTION
+
+FUNCTION bf_jump_back
+    ARRAY_GET mem %ptr% val
+    IF %val% > 0 CALL bf_scan_back
+ENDFUNCTION
+
+FUNCTION bf_scan_back
+    SET depth = 1
+    WHILE %depth% > 0
+        SET pc = %pc% - 1
+        ARRAY_GET tokens %pc% look
+        IF %look% == "]" SET depth = %depth% + 1
+        IF %look% == "[" SET depth = %depth% - 1
+    ENDWHILE
+ENDFUNCTION
+
+# 4. Main Execution Loop
+TIMER_START
+WHILE %pc% < %code_len%
+    ARRAY_GET tokens %pc% cmd
+    
+    IF %cmd% == "+" CALL bf_inc
+    IF %cmd% == "-" CALL bf_dec
+    IF %cmd% == ">" CALL bf_right
+    IF %cmd% == "<" CALL bf_left
+    IF %cmd% == "." CALL bf_output
+    IF %cmd% == "[" CALL bf_jump_fwd
+    IF %cmd% == "]" CALL bf_jump_back
+    
+    INCREMENT pc
+ENDWHILE
+
+TIMER_END elapsed
+PRINT [SYSTEM] Execution finished in %elapsed% seconds.
+SYSTEM Virtual Machine Halted.

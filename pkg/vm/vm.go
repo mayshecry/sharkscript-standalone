@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,20 +20,26 @@ import (
 )
 
 type Engine struct {
-	Filename       string
-	Instructions   []types.Instruction
-	Functions      map[string][]types.Instruction
-	Imports        map[string]bool
-	Vars           map[string]string
-	Arrays         map[string][]string
-	Headers        map[string]string
-	TimerStart     time.Time
-	mu             sync.RWMutex
-	out            *bufio.Writer
-	outMu          sync.Mutex
-	logPrefix      string
-	corePrefixes   []string
-	systemPrefixes []string
+	Filename          string
+	Instructions      []types.Instruction
+	Functions         map[string][]types.Instruction
+	Imports           map[string]bool
+	Vars              map[string]string
+	Arrays            map[string][]string
+	Headers           map[string]string
+	TimerStart        time.Time
+	mu                sync.RWMutex
+	out               *bufio.Writer
+	NumWorkers        int
+	outMu             sync.Mutex
+	UsesBypassTime    bool
+	bufferPool        sync.Pool
+	logPrefix         string
+	templateCache     sync.Map
+	corePrefixes      []string
+	corePrefixBytes   [][]byte
+	systemPrefixes    []string
+	systemPrefixBytes [][]byte
 }
 
 type boundHandler struct {
@@ -42,32 +49,97 @@ type boundHandler struct {
 
 func NewEngine(script types.CompiledScript, filename string) *Engine {
 	e := &Engine{
-		Filename:     filename,
-		Instructions: script.Main,
-		Functions:    script.Functions,
-		Imports:      make(map[string]bool),
-		Vars:         make(map[string]string),
-		Arrays:       make(map[string][]string),
-		Headers:      make(map[string]string),
-		out:          bufio.NewWriterSize(os.Stdout, 128*1024),
-		logPrefix:    "[" + filename + "] ",
+		Filename:       filename,
+		Instructions:   script.Main,
+		Functions:      script.Functions,
+		Imports:        make(map[string]bool),
+		Vars:           make(map[string]string),
+		Arrays:         make(map[string][]string),
+		Headers:        make(map[string]string),
+		out:            bufio.NewWriterSize(os.Stdout, 128*1024),
+		NumWorkers:     runtime.GOMAXPROCS(0),
+		UsesBypassTime: script.UsesBypassTime,
+		bufferPool: sync.Pool{
+			New: func() any { return bytes.NewBuffer(make([]byte, 0, 1024*1024)) },
+		},
+		logPrefix: "[" + filename + "] ",
 	}
 	for _, imp := range script.Imports {
 		e.Imports[imp] = true
 	}
 
 	e.corePrefixes = make([]string, 129)
+	e.corePrefixBytes = make([][]byte, 129)
 	e.systemPrefixes = make([]string, 129)
+	e.systemPrefixBytes = make([][]byte, 129)
 	for i := 0; i < 129; i++ {
 		p := "[" + filename + "] "
 		if i > 0 {
 			p = fmt.Sprintf("[%s] [Core %d] ", filename, i)
 		}
 		e.corePrefixes[i] = p
-		e.systemPrefixes[i] = p + "[SYSTEM] "
+		e.corePrefixBytes[i] = []byte(p)
+		sys := p + "[SYSTEM] "
+		e.systemPrefixes[i] = sys
+		e.systemPrefixBytes[i] = []byte(sys)
+	}
+
+	e.bake(e.Instructions)
+	for _, fn := range e.Functions {
+		e.bake(fn)
 	}
 
 	return e
+}
+
+func (e *Engine) bake(insts []types.Instruction) {
+	for i := range insts {
+		ins := &insts[i]
+
+		if !ins.IsStatic {
+			if strings.Contains(ins.Message, "%") {
+				ins.TemplateParts = e.parseTemplate(ins.Message)
+			}
+			if strings.Contains(ins.Value, "%") {
+			}
+		}
+
+		if ins.IsStatic {
+			switch ins.Op {
+			case types.OpPrint, types.OpIfPrint:
+				ins.Precomputed = make([][]byte, 129)
+				for c := 0; c < 129; c++ {
+					line := make([]byte, len(e.corePrefixBytes[c])+len(ins.Message)+1)
+					copy(line, e.corePrefixBytes[c])
+					copy(line[len(e.corePrefixBytes[c]):], ins.Message)
+					line[len(line)-1] = '\n'
+					ins.Precomputed[c] = line
+				}
+			case types.OpSystem:
+				ins.Precomputed = make([][]byte, 129)
+				for c := 0; c < 129; c++ {
+					line := make([]byte, len(e.systemPrefixBytes[c])+len(ins.Message)+1)
+					copy(line, e.systemPrefixBytes[c])
+					copy(line[len(e.systemPrefixBytes[c]):], ins.Message)
+					line[len(line)-1] = '\n'
+					ins.Precomputed[c] = line
+				}
+			case types.OpSetExpr:
+				ins.Message = e.evalMath(ins.Message)
+				ins.Op = types.OpSet
+			}
+		}
+		if len(ins.Body) > 0 {
+			e.bake(ins.Body)
+			if ins.Op == types.OpWhile || ins.Op == types.OpLoop || ins.Op == types.OpParallelLoop {
+				bound := make([]boundHandler, len(ins.Body))
+				for j, bIns := range ins.Body {
+					bound[j] = boundHandler{h: opTable[bIns.Op], ins: bIns}
+				}
+				ins.RuntimeState = bound
+			}
+		}
+	}
 }
 
 func (e *Engine) Run(pkt *types.PacketData) {
@@ -81,8 +153,10 @@ var opTable [256]instructionHandler
 
 func init() {
 	opTable[types.OpWhile] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		boundBody, _ := ins.RuntimeState.([]boundHandler)
+		innerLastIf := false
 		for e.evalLogic(ins.Condition, pkt) {
-			if e.execute(ins.Body, pkt) {
+			if e.executeBound(boundBody, pkt, &innerLastIf) {
 				break
 			}
 		}
@@ -99,13 +173,26 @@ func init() {
 		duration := time.Since(e.TimerStart).Seconds()
 		e.mu.RUnlock()
 		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
+			return false
+		}
 		e.Vars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
 		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpSet] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		val := e.expandVars(ins.Message, pkt)
+		var val string
+		if ins.IsStatic {
+			val = ins.Message
+		} else {
+			val = e.expandVars(ins.Message, pkt)
+		}
 		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Value] = val
+			return false
+		}
 		e.Vars[ins.Value] = val
 		e.mu.Unlock()
 		return false
@@ -113,11 +200,21 @@ func init() {
 	opTable[types.OpSetExpr] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		val := e.evalMath(e.expandVars(ins.Message, pkt))
 		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Value] = val
+			return false
+		}
 		e.Vars[ins.Value] = val
 		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpIncrement] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if pkt != nil && pkt.LocalVars != nil {
+			curr := pkt.LocalVars[ins.Value]
+			iv, _ := strconv.Atoi(curr)
+			pkt.LocalVars[ins.Value] = strconv.Itoa(iv + 1)
+			return false
+		}
 		e.mu.Lock()
 		curr := e.Vars[ins.Value]
 		iv, _ := strconv.Atoi(curr)
@@ -127,15 +224,12 @@ func init() {
 	}
 	opTable[types.OpLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		if len(ins.Body) == 0 {
-			count := ins.IntValue
-			if !ins.IsStatic {
-				count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
-			}
-			for i := 0; i < count; i++ {
-			}
 			return false
 		}
-		needsIter := e.containsIter(ins.Body)
+		needsIter := ins.NeedsIteration
+
+		boundBody, _ := ins.RuntimeState.([]boundHandler)
+		innerLastIf := false
 
 		dur := ins.Duration
 		if !ins.IsStatic {
@@ -155,7 +249,7 @@ func init() {
 				if needsIter {
 					pkt.Iteration = k
 				}
-				if e.execute(ins.Body, pkt) {
+				if e.executeBound(boundBody, pkt, &innerLastIf) {
 					return true
 				}
 			}
@@ -166,11 +260,29 @@ func init() {
 		if !ins.IsStatic {
 			count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
 		}
+
+		if ins.IsSinglePrintLoop {
+			pIns := ins.Body[0]
+			idx := 0
+			if pkt != nil && pkt.Core < 129 {
+				idx = pkt.Core
+			}
+			prefix := e.corePrefixBytes[idx]
+			for i := 0; i < count; i++ {
+				e.outMu.Lock()
+				e.out.Write(prefix)
+				e.writeExpanded(e.out, &pIns, &types.PacketData{Iteration: i, Core: idx})
+				e.out.WriteByte('\n')
+				e.outMu.Unlock()
+			}
+			return false
+		}
+
 		for i := 0; i < count; i++ {
 			if needsIter {
 				pkt.Iteration = i
 			}
-			if e.execute(ins.Body, pkt) {
+			if e.executeBound(boundBody, pkt, &innerLastIf) {
 				return true
 			}
 		}
@@ -179,13 +291,6 @@ func init() {
 	}
 	opTable[types.OpParallelLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		if len(ins.Body) == 0 {
-			count := ins.IntValue
-			if !ins.IsStatic {
-				count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
-			}
-			if count <= 0 {
-				return false
-			}
 			return false
 		}
 
@@ -196,13 +301,52 @@ func init() {
 		}
 		e.mu.RUnlock()
 
-		boundBody := make([]boundHandler, len(ins.Body))
-		for i, bIns := range ins.Body {
-			boundBody[i] = boundHandler{h: opTable[bIns.Op], ins: bIns}
+		boundBody, _ := ins.RuntimeState.([]boundHandler)
+
+		needsIter := ins.NeedsIteration
+		numWorkers := e.NumWorkers
+
+		count := ins.IntValue
+		if !ins.IsStatic {
+			count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
 		}
 
-		needsIter := e.containsIter(ins.Body)
-		numWorkers := runtime.GOMAXPROCS(0)
+		if ins.IsSinglePrintLoop {
+			pIns := ins.Body[0]
+			startLoop := time.Now()
+			var wg sync.WaitGroup
+			buffers := make([]*bytes.Buffer, numWorkers)
+			wg.Add(numWorkers)
+			for w := 0; w < numWorkers; w++ {
+				buf := e.bufferPool.Get().(*bytes.Buffer)
+				buf.Reset()
+				buffers[w] = buf
+				go func(s, n, id int, lb *bytes.Buffer) {
+					defer wg.Done()
+					bw := bufio.NewWriterSize(lb, 1024*1024)
+					prefix := e.corePrefixBytes[id+1]
+					lp := types.PacketData{Core: id + 1}
+					for i := s; i < n; i++ {
+						bw.Write(prefix)
+						lp.Iteration = i
+						e.writeExpanded(bw, &pIns, &lp)
+						bw.WriteByte('\n')
+					}
+					bw.Flush()
+				}((count*w)/numWorkers, (count*(w+1))/numWorkers, w, buf)
+			}
+			wg.Wait()
+			e.outMu.Lock()
+			for _, b := range buffers {
+				e.out.Write(b.Bytes())
+				e.bufferPool.Put(b)
+			}
+			e.out.WriteString(e.logPrefix)
+			fmt.Fprintf(e.out, "PARALLEL LOOP COMPLETE (FAST-PATH): %d iterations in %s\n", count, time.Since(startLoop))
+			e.outMu.Unlock()
+			e.out.Flush()
+			return false
+		}
 
 		dur := ins.Duration
 		if !ins.IsStatic {
@@ -221,14 +365,20 @@ func init() {
 			iterCounts := make([]uint64, numWorkers)
 
 			for w := 0; w < numWorkers; w++ {
-				buffers[w] = bytes.NewBuffer(make([]byte, 0, 1024*1024))
-				go func(id int, localBuf *bytes.Buffer) {
+				buf := e.bufferPool.Get().(*bytes.Buffer)
+				buf.Reset()
+				buffers[w] = buf
+				go func(id int, lb *bytes.Buffer) {
 					defer wg.Done()
-					bw := bufio.NewWriterSize(localBuf, 1024*1024)
+					bw := bufio.NewWriterSize(lb, 1024*1024)
 					lp := *pkt
+					localVars := make(map[string]string, len(snapshot))
+					for k, v := range snapshot {
+						localVars[k] = v
+					}
+					lp.LocalVars = localVars
 					lp.Core = id + 1
 					lp.Writer = bw
-					lp.LocalVars = snapshot
 					innerLastIf := false
 					var k int
 					for ; ; k++ {
@@ -238,15 +388,13 @@ func init() {
 						if needsIter {
 							lp.Iteration = k
 						}
-						for _, bh := range boundBody {
-							if bh.h(e, bh.ins, &lp, &innerLastIf) {
-								break
-							}
+						if e.executeBound(boundBody, &lp, &innerLastIf) {
+							break
 						}
 					}
 					bw.Flush()
 					iterCounts[id] = uint64(k)
-				}(w, buffers[w])
+				}(w, buf)
 			}
 			wg.Wait()
 
@@ -258,6 +406,7 @@ func init() {
 			e.outMu.Lock()
 			for _, b := range buffers {
 				e.out.Write(b.Bytes())
+				e.bufferPool.Put(b)
 			}
 			coreIds := make([]string, numWorkers)
 			for i := 0; i < numWorkers; i++ {
@@ -276,10 +425,6 @@ func init() {
 			return false
 		}
 
-		count := ins.IntValue
-		if !ins.IsStatic {
-			count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
-		}
 		if count <= 0 {
 			return false
 		}
@@ -297,29 +442,45 @@ func init() {
 
 		wg.Add(numWorkers)
 		for w := 0; w < numWorkers; w++ {
-			buffers[w] = bytes.NewBuffer(make([]byte, 0, (count/numWorkers)*64))
+			buf := e.bufferPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			buffers[w] = buf
 			start := (count * w) / numWorkers
 			end := (count * (w + 1)) / numWorkers
-			go func(s, n, id int, localBuf *bytes.Buffer) {
+			go func(s, n, id int, lb *bytes.Buffer) {
 				defer wg.Done()
-				bw := bufio.NewWriterSize(localBuf, 1024*1024)
+				bw := bufio.NewWriterSize(lb, 1024*1024)
 				lp := *pkt
+				localVars := make(map[string]string, len(snapshot))
+				for k, v := range snapshot {
+					localVars[k] = v
+				}
+				lp.LocalVars = localVars
 				lp.Core = id + 1
 				lp.Writer = bw
-				lp.LocalVars = snapshot
 				innerLastIf := false
-				for i := s; i < n; i++ {
-					if needsIter {
-						lp.Iteration = i
-					}
-					for _, bh := range boundBody {
+				if len(boundBody) == 1 {
+					bh := boundBody[0]
+					for i := s; i < n; i++ {
+						if needsIter {
+							lp.Iteration = i
+						}
 						if bh.h(e, bh.ins, &lp, &innerLastIf) {
+							break
+						}
+					}
+				} else {
+					for i := s; i < n; i++ {
+						if needsIter {
+							lp.Iteration = i
+						}
+						if e.executeBound(boundBody, &lp, &innerLastIf) {
 							break
 						}
 					}
 				}
 				bw.Flush()
-			}(start, end, w, buffers[w])
+			}(start, end, w, buf)
 		}
 		wg.Wait()
 		elapsed := time.Since(startLoop)
@@ -327,6 +488,7 @@ func init() {
 		e.outMu.Lock()
 		for _, b := range buffers {
 			e.out.Write(b.Bytes())
+			e.bufferPool.Put(b)
 		}
 
 		coreIds := make([]string, numWorkers)
@@ -347,44 +509,131 @@ func init() {
 		e.out.Flush()
 		return false
 	}
+	opTable[types.OpEmptyParallelLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if !e.UsesBypassTime && ins.Duration == 0 {
+			return false
+		}
+
+		startLoop := time.Now()
+		dur := ins.Duration
+		if !ins.IsStatic {
+			val := strings.ToLower(e.expandVars(ins.Value, pkt))
+			val = strings.ReplaceAll(val, "min", "m")
+			if d, err := time.ParseDuration(val); err == nil {
+				dur = d
+			}
+		}
+
+		if dur > 0 {
+			time.Sleep(dur)
+			elapsed := time.Since(startLoop)
+			msVal := strconv.FormatFloat(float64(elapsed.Nanoseconds())/1e6, 'f', 9, 64)
+			e.mu.Lock()
+			e.Vars["BYPASS_TIME"] = msVal
+			if pkt != nil && pkt.LocalVars != nil {
+				pkt.LocalVars["BYPASS_TIME"] = msVal
+			}
+			e.mu.Unlock()
+			if !e.UsesBypassTime {
+				e.outMu.Lock()
+				e.out.WriteString(e.logPrefix)
+				e.out.WriteString("EMPTY PARALLEL DURATION LOOP COMPLETE: ")
+				e.out.WriteString(dur.String())
+				e.out.WriteString(" (VM BYPASS)\n")
+				e.outMu.Unlock()
+			}
+			return false
+		}
+
+		count := ins.IntValue
+		if !ins.IsStatic {
+			count, _ = strconv.Atoi(e.expandVars(ins.Value, pkt))
+		}
+
+		elapsed := time.Since(startLoop)
+		msVal := strconv.FormatFloat(float64(elapsed.Nanoseconds())/1e6, 'f', 9, 64)
+		e.mu.Lock()
+		e.Vars["BYPASS_TIME"] = msVal
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars["BYPASS_TIME"] = msVal
+		}
+		e.mu.Unlock()
+		if !e.UsesBypassTime {
+			e.outMu.Lock()
+			e.out.WriteString(e.logPrefix)
+			e.out.WriteString("EMPTY PARALLEL LOOP COMPLETE: ")
+			e.out.WriteString(strconv.Itoa(count))
+			e.out.WriteString(" iterations in ")
+			e.out.WriteString(elapsed.String())
+			e.out.WriteString(" (VM BYPASS)\n")
+			e.outMu.Unlock()
+		}
+		return false
+	}
 	opTable[types.OpPrint] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		msg := e.expandVars(ins.Message, pkt)
 		idx := 0
-		if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+		if pkt != nil && pkt.Core < 129 {
 			idx = pkt.Core
 		}
 
 		if pkt != nil && pkt.Writer != nil {
-			pkt.Writer.Write([]byte(e.corePrefixes[idx]))
-			pkt.Writer.Write([]byte(msg))
-			pkt.Writer.Write([]byte{'\n'})
+			if ins.Precomputed != nil {
+				pkt.Writer.Write(ins.Precomputed[idx])
+			} else {
+				if bw, ok := pkt.Writer.(*bufio.Writer); ok {
+					bw.Write(e.corePrefixBytes[idx])
+					e.writeExpanded(bw, &ins, pkt)
+					bw.WriteByte('\n')
+				} else {
+					pkt.Writer.Write(e.corePrefixBytes[idx])
+					e.writeExpanded(pkt.Writer, &ins, pkt)
+					pkt.Writer.Write([]byte{'\n'})
+				}
+			}
+			return false
+		}
+
+		if ins.Precomputed != nil {
+			e.outMu.Lock()
+			e.out.Write(ins.Precomputed[idx])
+			e.outMu.Unlock()
 			return false
 		}
 
 		e.outMu.Lock()
-		e.out.WriteString(e.corePrefixes[idx])
-		e.out.WriteString(msg)
+		e.out.Write(e.corePrefixBytes[idx])
+		e.writeExpanded(e.out, &ins, pkt)
 		e.out.WriteByte('\n')
 		e.outMu.Unlock()
 		return false
 	}
 	opTable[types.OpSystem] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		msg := e.expandVars(ins.Message, pkt)
 		idx := 0
-		if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+		if pkt != nil && pkt.Core < 129 {
 			idx = pkt.Core
 		}
 
 		if pkt != nil && pkt.Writer != nil {
-			pkt.Writer.Write([]byte(e.systemPrefixes[idx]))
-			pkt.Writer.Write([]byte(msg))
+			if ins.Precomputed != nil {
+				pkt.Writer.Write(ins.Precomputed[idx])
+			} else {
+				pkt.Writer.Write(e.systemPrefixBytes[idx])
+				e.writeExpanded(pkt.Writer, &ins, pkt)
+				pkt.Writer.Write([]byte{'\n'})
+			}
+			return false
+		}
+
+		if ins.Precomputed != nil {
+			pkt.Writer.Write(e.systemPrefixBytes[idx])
+			e.writeExpanded(pkt.Writer, &ins, pkt)
 			pkt.Writer.Write([]byte{'\n'})
 			return false
 		}
 
 		e.outMu.Lock()
-		e.out.WriteString(e.systemPrefixes[idx])
-		e.out.WriteString(msg)
+		e.out.Write(e.systemPrefixBytes[idx])
+		e.writeExpanded(e.out, &ins, pkt)
 		e.out.WriteByte('\n')
 		e.outMu.Unlock()
 		return false
@@ -401,8 +650,12 @@ func init() {
 		return false
 	}
 	opTable[types.OpTime] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		e.mu.Lock()
 		ms := float64(time.Now().UnixNano()) / 1e6
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Value] = strconv.FormatFloat(ms, 'f', 9, 64)
+			return false
+		}
+		e.mu.Lock()
 		e.Vars[ins.Value] = strconv.FormatFloat(ms, 'f', 9, 64)
 		e.mu.Unlock()
 		return false
@@ -425,22 +678,32 @@ func init() {
 	opTable[types.OpIfPrint] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		if e.evalLogic(ins.Condition, pkt) {
 			*lastIfMet = true
-			msg := e.expandVars(ins.Message, pkt)
 			idx := 0
-			if pkt != nil && pkt.Core > 0 && pkt.Core < 129 {
+			if pkt != nil && pkt.Core < 129 {
 				idx = pkt.Core
 			}
 
+			if ins.Precomputed != nil {
+				if pkt != nil && pkt.Writer != nil {
+					pkt.Writer.Write(ins.Precomputed[idx])
+					return false
+				}
+				e.outMu.Lock()
+				e.out.Write(ins.Precomputed[idx])
+				e.outMu.Unlock()
+				return false
+			}
+
 			if pkt != nil && pkt.Writer != nil {
-				pkt.Writer.Write([]byte(e.corePrefixes[idx]))
-				pkt.Writer.Write([]byte(msg))
+				pkt.Writer.Write(e.corePrefixBytes[idx])
+				e.writeExpanded(pkt.Writer, &ins, pkt)
 				pkt.Writer.Write([]byte{'\n'})
 				return false
 			}
 
 			e.outMu.Lock()
-			e.out.WriteString(e.corePrefixes[idx])
-			e.out.WriteString(msg)
+			e.out.Write(e.corePrefixBytes[idx])
+			e.writeExpanded(e.out, &ins, pkt)
 			e.out.WriteByte('\n')
 			e.outMu.Unlock()
 		} else {
@@ -500,6 +763,7 @@ func init() {
 					outputMu.Unlock()
 				}
 			}
+			_ = scanner.Err()
 			return localCount
 		}
 
@@ -567,11 +831,12 @@ func init() {
 		arrayName := mParts[1]
 
 		var tokens []string
-		if delim == "SPACE" {
+		switch delim {
+		case "SPACE":
 			tokens = strings.Fields(src)
-		} else if delim == "NEWLINE" {
+		case "NEWLINE":
 			tokens = strings.Split(src, "\n")
-		} else {
+		default:
 			tokens = strings.Split(src, delim)
 		}
 
@@ -635,6 +900,42 @@ func init() {
 		e.mu.Lock()
 		e.Vars[target] = strconv.Itoa(idx)
 		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpInput] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		fmt.Print(e.expandVars(ins.Message, pkt))
+		reader := bufio.NewReader(os.Stdin)
+		text, _ := reader.ReadString('\n')
+		val := strings.TrimSpace(text)
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Value] = val
+		} else {
+			e.Vars[ins.Value] = val
+		}
+		return false
+	}
+
+	opTable[types.OpIfCall] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if e.evalLogic(ins.Condition, pkt) {
+			*lastIfMet = true
+			if f, ok := e.Functions[ins.Message]; ok {
+				return e.execute(f, pkt)
+			}
+		} else {
+			*lastIfMet = false
+		}
+		return false
+	}
+
+	opTable[types.OpIfBreak] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if e.evalLogic(ins.Condition, pkt) {
+			*lastIfMet = true
+			return true
+		}
+		*lastIfMet = false
 		return false
 	}
 }
@@ -749,23 +1050,29 @@ func (e *Engine) killProcess(pkt *types.PacketData) {
 }
 
 func (e *Engine) evalMath(expr string) string {
-	expr = strings.ReplaceAll(expr, " ", "")
-	var tokens []string
-	var buf strings.Builder
-
-	for _, r := range expr {
-		if strings.ContainsRune("+-*/", r) {
-			if buf.Len() > 0 {
-				tokens = append(tokens, buf.String())
-				buf.Reset()
+	tokens := make([]string, 0, 8)
+	start := -1
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			if start != -1 {
+				tokens = append(tokens, expr[start:i])
+				start = -1
 			}
-			tokens = append(tokens, string(r))
-		} else {
-			buf.WriteRune(r)
+			continue
+		}
+		if c == '+' || c == '-' || c == '*' || c == '/' {
+			if start != -1 {
+				tokens = append(tokens, expr[start:i])
+			}
+			tokens = append(tokens, string(c))
+			start = -1
+		} else if start == -1 {
+			start = i
 		}
 	}
-	if buf.Len() > 0 {
-		tokens = append(tokens, buf.String())
+	if start != -1 {
+		tokens = append(tokens, expr[start:])
 	}
 
 	if len(tokens) < 3 {
@@ -804,9 +1111,10 @@ func (e *Engine) evalMath(expr string) string {
 		}
 		op := highPrec[i]
 		val, _ := strconv.ParseFloat(highPrec[i+1], 64)
-		if op == "+" {
+		switch op {
+		case "+":
 			total += val
-		} else if op == "-" {
+		case "-":
 			total -= val
 		}
 	}
@@ -814,7 +1122,104 @@ func (e *Engine) evalMath(expr string) string {
 	return strconv.FormatFloat(total, 'f', 9, 64)
 }
 
+func (e *Engine) parseTemplate(input string) []string {
+	var parts []string
+	curr := input
+	for {
+		idx := strings.IndexByte(curr, '%')
+		if idx == -1 {
+			parts = append(parts, curr)
+			break
+		}
+		parts = append(parts, curr[:idx])
+		curr = curr[idx+1:]
+		end := strings.IndexByte(curr, '%')
+		if end == -1 {
+			parts = append(parts, "%"+curr)
+			break
+		}
+		parts = append(parts, curr[:end])
+		curr = curr[end+1:]
+	}
+	return parts
+}
+
+func (e *Engine) writeExpanded(w io.Writer, ins *types.Instruction, pkt *types.PacketData) {
+	parts := ins.TemplateParts
+	if len(parts) == 0 {
+		io.WriteString(w, e.expandVars(ins.Message, pkt))
+		return
+	}
+
+	var sw io.StringWriter
+	if s, ok := w.(io.StringWriter); ok {
+		sw = s
+	}
+
+	var b [20]byte
+	for i, p := range parts {
+		if i%2 == 0 {
+			if sw != nil {
+				sw.WriteString(p)
+			} else {
+				io.WriteString(w, p)
+			}
+		} else {
+			handled := false
+			if pkt != nil {
+				switch p {
+				case "ITER":
+					w.Write(strconv.AppendInt(b[:0], int64(pkt.Iteration), 10))
+					handled = true
+				case "CORE":
+					w.Write(strconv.AppendInt(b[:0], int64(pkt.Core), 10))
+					handled = true
+				case "SRC_IP":
+					if sw != nil {
+						sw.WriteString(pkt.SrcIP)
+					} else {
+						w.Write([]byte(pkt.SrcIP))
+					}
+					handled = true
+				case "DST_IP":
+					if sw != nil {
+						sw.WriteString(pkt.DstIP)
+					} else {
+						w.Write([]byte(pkt.DstIP))
+					}
+					handled = true
+				}
+			}
+			if !handled {
+				var v string
+				var vOk bool
+				if pkt != nil && pkt.LocalVars != nil {
+					v, vOk = pkt.LocalVars[p]
+				} else {
+					e.mu.RLock()
+					v, vOk = e.Vars[p]
+					e.mu.RUnlock()
+				}
+				if !vOk {
+					if sw != nil {
+						sw.WriteString("%" + p + "%")
+					} else {
+						w.Write([]byte("%" + p + "%"))
+					}
+				} else {
+					if sw != nil {
+						sw.WriteString(v)
+					} else {
+						w.Write([]byte(v))
+					}
+				}
+			}
+		}
+	}
+}
+
 func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
+	input = strings.ReplaceAll(input, "\\033", "\x1b")
 	if !strings.Contains(input, "%") {
 		return input
 	}
@@ -879,15 +1284,19 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 			}
 
 			if !ok {
-				sb.WriteString("%" + key + "%")
+				sb.WriteByte('%')
+				sb.WriteString(key)
+				sb.WriteByte('%')
 			} else {
 				f, err := strconv.ParseFloat(val, 64)
 				if err == nil && f > 0 && f < 1 {
 					if strings.HasPrefix(curr[end+1:], "ms") {
 						if f < 0.001 {
-							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64) + " nanoseconds")
+							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
+							sb.WriteString(" nanoseconds")
 						} else {
-							sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64) + " microseconds")
+							sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64))
+							sb.WriteString(" microseconds")
 						}
 						curr = curr[end+3:]
 						continue
@@ -895,11 +1304,14 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 						next := curr[end+1:]
 						if len(next) == 1 || next[1] == ' ' || next[1] == '\n' || next[1] == '\t' || next[1] == '.' || next[1] == ',' {
 							if f < 0.000001 {
-								sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64) + " nanoseconds")
+								sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64))
+								sb.WriteString(" nanoseconds")
 							} else if f < 0.001 {
-								sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64) + " microseconds")
+								sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
+								sb.WriteString(" microseconds")
 							} else {
-								sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64) + " ms")
+								sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64))
+								sb.WriteString(" ms")
 							}
 							curr = curr[end+2:]
 							continue
@@ -912,4 +1324,13 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 		curr = curr[end+1:]
 	}
 	return sb.String()
+}
+
+func (e *Engine) executeBound(bound []boundHandler, pkt *types.PacketData, lastIfMet *bool) bool {
+	for _, bh := range bound {
+		if bh.h(e, bh.ins, pkt, lastIfMet) {
+			return true
+		}
+	}
+	return false
 }
