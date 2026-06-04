@@ -1,103 +1,65 @@
-# SharkScript
+# SHARKSCRIPT
 
-SharkScript is a high-performance, domain-specific scripting language designed for real-time network packet analysis, automation, and system orchestration. It features a custom bytecode compiler, a fast VM with a lookup-table dispatcher, and a parallel execution engine.
+SharkScript is a high-performance domain-specific language and virtual machine engineered for real-time packet analysis, system orchestration, and low-latency automation. It is designed for environments where microsecond-level execution is a hard requirement.
 
-## Features
+Detailed documentation is available at: https://larping.today/docs.html
 
-- **Custom Bytecode**: Compiles `.shark` source into optimized `.shx` (shx02) bytecode.
-- **Parallel Execution**: Native support for multi-threaded loops using `PARALLEL LOOP`.
-- **High-Precision Math**: Support for floating-point arithmetic with operator precedence (+, -, *, /).
-- **Logic Engine**: Complex boolean logic evaluation (AND/OR) with packet-specific primitives.
-- **Networking**: Integrated HTTP GET/POST, ISP lookup, and packet spoofing/redirection.
-- **System Integration**: Asynchronous shell execution and process management (PID killing).
+## TECHNICAL PILLARS
 
-## Installation
+### SHARK01 BYTECODE ENGINE
+The compiler translates .shark source into a serialized instruction tree (LIGMA02 specification). The Virtual Machine utilizes an O(1) jump table dispatcher, bypassing the performance overhead found in traditional switch-case or map-lookup based interpreters.
 
-Use the provided setup script to install the Go environment and the `shs` binary:
+### MULTI-CORE PARALLELISM
+High-throughput tasks leverage the parallel execution engine. By generating thread-local memory snapshots, the VM enables lock-free concurrency across all available CPU cores, preventing RWMutex contention bottlenecks during heavy iteration cycles.
+
+### AOT TRANSPILLATION
+For maximum performance, SharkScript supports Ahead-of-Time compilation. This process transpiles script logic into native Go source, which is then compiled into a stripped, standalone binary. This removes the VM layer entirely and allows for zero-overhead execution.
+
+### MEMORY OPTIMIZATION
+The math and string expansion engines are built on a zero-allocation philosophy. By utilizing sync.Pool for buffer management and pre-calculating static templates during the "bake" phase, the runtime significantly reduces Garbage Collector pressure.
+
+## CLI USAGE
+
+### BYTECODE COMPILATION
+Generate an optimized .shx bytecode file from source.
+```bash
+shs compile script.shark
+```
+
+### VIRTUAL MACHINE EXECUTION
+Run the SharkScript VM against a compiled bytecode file.
+```bash
+shs run script.shx
+```
+
+### NATIVE BINARY GENERATION (AOT)
+Generate a standalone native binary for a specific target operating system.
+```bash
+shs aot script.shark -os linux
+```
+
+## ARCHITECTURE VERIFICATION
+
+The following benchmark demonstrates the parallel engine capability by executing one million iterations.
+
+```plaintext
+TIME start
+
+PARALLEL LOOP 1000000
+  # Multi-core iterations occur here
+ENDLOOP
+
+TIME end
+SET duration = %end% - %start%
+
+PRINT Benchmark: 1,000,000 iterations processed in %duration%ms
+```
+
+For a comprehensive list of opcodes, built-in symbols, and hardware interaction primitives, see the language specification in the docs.
+
+## SETUP
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
-```
-
-## Usage
-
-### Compiling a script
-```bash
-shs --compile examples/benchmark.shark
-```
-
-### Running a script
-```bash
-shs --run examples/benchmark.shx
-```
-
-## Language Syntax
-
-### Variables and Types
-Variables are stored as strings and can be referenced using `%VAR_NAME%`. The VM automatically resolves these during execution.
-
-- `SET name value` : Simple string assignment.
-- `SET result = 10 + 5 * 2` : Math assignment (supports precedence).
-- `INCREMENT counter` : Adds 1 to the variable.
-
-### Control Flow
-
-#### Loops
-Loops support both iteration counts and time durations.
-- `LOOP 1000` : Runs 1000 times.
-- `LOOP 5s` : Runs repeatedly for 5 seconds. Supports `ms`, `s`, `min`.
-- `PARALLEL LOOP 1000000` : Distributes iterations across all available CPU cores.
-
-#### While
-- `WHILE %status% == active` : Executes as long as the condition is met.
-
-### Logic and Conditions
-The `IF` statement supports several actions: `PRINT`, `CALL`, `BLOCK`, `EXEC`, `HTTP`, `BREAK`.
-
-- `IF %PROTO% == TCP PRINT Protocol is TCP`
-- `IF MALICIOUS AND %DST_IP% == 8.8.8.8 BLOCK`
-- `IF CONTAINS "payload_str" ALERT Threat Detected`
-
-### Networking & Packet Manipulation
-- `HTTP GET <url> <target_var>` : Fetches a URL.
-- `HTTP POST <url> <body>` : Sends an async JSON POST.
-- `SPOOF <ip>` : Changes the source IP in the packet data.
-- `REDIRECT <port>` : Changes the destination port.
-- `GET_ISP <ip> <var>` : Retrieves the ISP name for the given IP.
-
-### System Actions
-- `EXEC <command>` : Runs a system command asynchronously.
-- `BLOCK` or `BashKILL_PID` : Terminates the process associated with the current packet.
-- `SLEEP <ms>` : Pauses the current execution thread.
-- `LOG <message>` : Writes a timestamped entry to `shark.log`.
-
-### Benchmarking
-- `TIME <var>` : Captures current Unix time in fractional milliseconds.
-- `TIMER_START` / `TIMER_END <var>` : Utility to measure execution duration in seconds.
-
-## Built-in Variables
-
-When running against packet data, the following variables are pre-populated:
-- `%SRC_IP%`
-- `%DST_IP%`
-- `%PROTO%`
-- `%PROCESS%`
-- `%PID%`
-
-## Example: Benchmark
-
-```plaintext
-# Capture start time
-TIME start
-
-# Run 1 million empty iterations in parallel
-PARALLEL LOOP 1000000
-ENDLOOP
-
-# Calculate delta
-TIME end
-SET duration = %end% - %start%
-
-PRINT Counted to a million in %duration%ms
 ```
