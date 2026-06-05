@@ -27,7 +27,7 @@ type Engine struct {
 	Vars              map[string]string
 	Arrays            map[string][]string
 	Headers           map[string]string
-	TimerStart        time.Time
+	Timers            map[string]time.Time
 	mu                sync.RWMutex
 	out               *bufio.Writer
 	NumWorkers        int
@@ -56,6 +56,7 @@ func NewEngine(script types.CompiledScript, filename string) *Engine {
 		Vars:           make(map[string]string),
 		Arrays:         make(map[string][]string),
 		Headers:        make(map[string]string),
+		Timers:         make(map[string]time.Time),
 		out:            bufio.NewWriterSize(os.Stdout, 128*1024),
 		NumWorkers:     runtime.GOMAXPROCS(0),
 		UsesBypassTime: script.UsesBypassTime,
@@ -164,21 +165,33 @@ func init() {
 	}
 	opTable[types.OpTimerStart] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		e.mu.Lock()
-		e.TimerStart = time.Now()
+		key := ins.Value
+		if key == "" {
+			key = "DEFAULT"
+		}
+		e.Timers[key] = time.Now()
 		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpTimerEnd] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		key := ins.Value
+		if key == "" {
+			key = "DEFAULT"
+		}
 		e.mu.RLock()
-		duration := time.Since(e.TimerStart).Seconds()
+		start, ok := e.Timers[key]
 		e.mu.RUnlock()
+		if !ok {
+			return false
+		}
+		duration := time.Since(start).Seconds()
 		e.mu.Lock()
+		defer e.mu.Unlock()
 		if pkt != nil && pkt.LocalVars != nil {
 			pkt.LocalVars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
 			return false
 		}
 		e.Vars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
-		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpSet] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -189,23 +202,23 @@ func init() {
 			val = e.expandVars(ins.Message, pkt)
 		}
 		e.mu.Lock()
+		defer e.mu.Unlock()
 		if pkt != nil && pkt.LocalVars != nil {
 			pkt.LocalVars[ins.Value] = val
 			return false
 		}
 		e.Vars[ins.Value] = val
-		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpSetExpr] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		val := e.evalMath(e.expandVars(ins.Message, pkt))
 		e.mu.Lock()
+		defer e.mu.Unlock()
 		if pkt != nil && pkt.LocalVars != nil {
 			pkt.LocalVars[ins.Value] = val
 			return false
 		}
 		e.Vars[ins.Value] = val
-		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpIncrement] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -216,10 +229,10 @@ func init() {
 			return false
 		}
 		e.mu.Lock()
+		defer e.mu.Unlock()
 		curr := e.Vars[ins.Value]
 		iv, _ := strconv.Atoi(curr)
 		e.Vars[ins.Value] = strconv.Itoa(iv + 1)
-		e.mu.Unlock()
 		return false
 	}
 	opTable[types.OpLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -646,7 +659,19 @@ func init() {
 		} else {
 			cmd = exec.Command("sh", "-c", expanded)
 		}
-		go cmd.Run()
+		if ins.Value != "" {
+			out, _ := cmd.CombinedOutput()
+			val := strings.TrimSpace(string(out))
+			e.mu.Lock()
+			if pkt != nil && pkt.LocalVars != nil {
+				pkt.LocalVars[ins.Value] = val
+			} else {
+				e.Vars[ins.Value] = val
+			}
+			e.mu.Unlock()
+		} else {
+			go cmd.Run()
+		}
 		return false
 	}
 	opTable[types.OpTime] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -1147,7 +1172,7 @@ func (e *Engine) parseTemplate(input string) []string {
 func (e *Engine) writeExpanded(w io.Writer, ins *types.Instruction, pkt *types.PacketData) {
 	parts := ins.TemplateParts
 	if len(parts) == 0 {
-		io.WriteString(w, e.expandVars(ins.Message, pkt))
+		io.WriteString(w, convertMinecraftColors(e.expandVars(ins.Message, pkt)))
 		return
 	}
 
@@ -1218,10 +1243,25 @@ func (e *Engine) writeExpanded(w io.Writer, ins *types.Instruction, pkt *types.P
 	}
 }
 
+func convertMinecraftColors(input string) string {
+	if !strings.Contains(input, "&") {
+		return input
+	}
+	replacer := strings.NewReplacer(
+		"&0", "\x1b[30m", "&1", "\x1b[34m", "&2", "\x1b[32m", "&3", "\x1b[36m",
+		"&4", "\x1b[31m", "&5", "\x1b[35m", "&6", "\x1b[33m", "&7", "\x1b[37m",
+		"&8", "\x1b[90m", "&9", "\x1b[94m", "&a", "\x1b[92m", "&b", "\x1b[96m",
+		"&c", "\x1b[91m", "&d", "\x1b[95m", "&e", "\x1b[93m", "&f", "\x1b[97m",
+		"&l", "\x1b[1m", "&m", "\x1b[9m", "&n", "\x1b[4m", "&o", "\x1b[3m",
+		"&r", "\x1b[0m",
+	)
+	return replacer.Replace(input)
+}
+
 func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 	input = strings.ReplaceAll(input, "\\033", "\x1b")
 	if !strings.Contains(input, "%") {
-		return input
+		return convertMinecraftColors(input)
 	}
 
 	var sb strings.Builder
@@ -1323,7 +1363,7 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 		}
 		curr = curr[end+1:]
 	}
-	return sb.String()
+	return convertMinecraftColors(sb.String())
 }
 
 func (e *Engine) executeBound(bound []boundHandler, pkt *types.PacketData, lastIfMet *bool) bool {

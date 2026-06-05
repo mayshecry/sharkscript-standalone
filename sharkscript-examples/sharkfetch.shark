@@ -5,6 +5,14 @@ READ_FILE /etc/hostname host
 READ_FILE /etc/os-release os_info
 READ_FILE /proc/version kernel_raw
 READ_FILE /proc/meminfo mem_raw
+
+# CPU: Get only the "model name" line from cpuinfo and clean it
+EXEC "grep 'model name' /proc/cpuinfo | head -n 1 | cut -d: -f2" cpu_model
+
+# GPU: Get the VGA controller info and strip the PCI address/controller prefix
+# This grabs the text AFTER the colon in the lspci output
+EXEC "lspci | grep 'VGA' | cut -d: -f3 | sed 's/^[ \t]*//'" gpu_name
+
 TOKENIZE %os_info% " os_parts
 ARRAY_GET os_parts 1 os_name
 TOKENIZE %kernel_raw% SPACE kernel_parts
@@ -12,16 +20,18 @@ ARRAY_GET kernel_parts 2 kernel_ver
 TOKENIZE %mem_raw% SPACE mem_tokens
 ARRAY_GET mem_tokens 1 mem_kb
 SET mem_mb = %mem_kb% / 1024
+
 PRINT 
-PRINT        .            root@%host%
-PRINT       / \           --------------------------
-PRINT      /   \          OS:      %os_name%
-PRINT     /     \         Host:    %host%
-PRINT    /   _   \        Kernel:  %kernel_ver%
-PRINT   /   | |   \       Memory:  %mem_kb% kB (~%mem_mb% MB)
-PRINT  /____| |____\      Shell:   shs-vm (SHARK01)
-PRINT       | |           Display: 1920x1080 (Virtual)
-PRINT       |_|
+PRINT &5        .           &9&lroot&f@&f%host%
+PRINT &5       / \          &7--------------------------
+PRINT &5      /   \         &9&lOS:      &f%os_name%
+PRINT &5     /     \        &9&lHost:    &f%host%
+PRINT &5    /  _    \       &9&lKernel:  &f%kernel_ver%
+PRINT &5   /  | |    \      &9&lCPU:     &f%cpu_model%
+PRINT &5  /____| |____\     &9&lGPU:     &f%gpu_name%
+PRINT &5       | |          &9&lMemory:  &f%mem_kb% kB (~%mem_mb% MB)
+PRINT &5       |_|          &9&lShell:   &fshs-vm (SHARK01)
+PRINT &5                    &9&lDisplay: &f1920x1080 (Virtual)
 PRINT 
 PRINT 
 TIMER_START fetch_time

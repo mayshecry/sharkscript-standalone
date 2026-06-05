@@ -15,7 +15,7 @@ import (
 )
 
 func Compile(srcPath string) error {
-	fmt.Printf(" Initializing Build: %s\n", srcPath)
+	fmt.Printf("🏗️  Initializing Build: %s\n", srcPath)
 
 	script, lineNum, err := Parse(srcPath)
 	if err != nil {
@@ -285,7 +285,13 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			ins.Value = path
 		case "TIMER_START":
 			ins.Op = types.OpTimerStart
+			if len(parts) > 1 {
+				ins.Value = parts[1]
+			}
 		case "TIMER_END":
+			if len(parts) < 2 {
+				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: TIMER_END requires a target variable name", lineNum)
+			}
 			ins.Op, ins.Value = types.OpTimerEnd, parts[1]
 		case "SET":
 			if len(parts) < 3 {
@@ -386,7 +392,20 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 		case "SLEEP":
 			ins.Op, ins.Value = types.OpSleep, parts[1]
 		case "EXEC":
-			ins.Op, ins.Message = types.OpExec, strings.Join(parts[1:], " ")
+			idx := strings.Index(strings.ToUpper(rawLine), "EXEC")
+			content := strings.TrimSpace(rawLine[idx+4:])
+			if strings.HasPrefix(content, "\"") {
+				endQuote := strings.LastIndex(content, "\"")
+				if endQuote > 0 {
+					ins.Op = types.OpExec
+					ins.Message = content[1:endQuote]
+					ins.Value = strings.TrimSpace(content[endQuote+1:])
+				} else {
+					ins.Op, ins.Message = types.OpExec, content
+				}
+			} else {
+				ins.Op, ins.Message = types.OpExec, content
+			}
 		case "INPUT":
 			if len(parts) >= 2 {
 				if err := validateVar(parts[1], lineNum); err != nil {
@@ -535,6 +554,7 @@ func GenerateGo(script types.CompiledScript) string {
 		"strings":               false,
 		"strconv":               false,
 		"fmt":                   false,
+		"os/exec":               false,
 	}
 
 	needsEvalMath := false
@@ -543,7 +563,7 @@ func GenerateGo(script types.CompiledScript) string {
 	var analyze func([]types.Instruction)
 	analyze = func(insts []types.Instruction) {
 		for _, ins := range insts {
-			if strings.Contains(ins.Message, "%") || strings.Contains(ins.Value, "%") {
+			if strings.Contains(ins.Message, "%") || strings.Contains(ins.Value, "%") || strings.Contains(ins.Message, "&") || strings.Contains(ins.Value, "&") {
 				needsExpandVars = true
 			}
 			switch ins.Op {
@@ -560,6 +580,9 @@ func GenerateGo(script types.CompiledScript) string {
 					required["strconv"] = true
 					needsEvalMath = true
 				}
+			case types.OpExec:
+				required["os/exec"] = true
+				required["strings"] = true
 			case types.OpIncrement:
 				required["strconv"] = true
 			case types.OpParallelLoop:
@@ -603,22 +626,23 @@ func GenerateGo(script types.CompiledScript) string {
 
 	sb.WriteString("func main() {\n")
 	sb.WriteString("\tout := bufio.NewWriter(os.Stdout)\n")
-	sb.WriteString("\tExecute(&types.PacketData{}, make(map[string]string), make(map[string][]string), out)\n")
+	sb.WriteString("\tExecute(&types.PacketData{}, make(map[string]string), make(map[string][]string), make(map[string]time.Time), out)\n")
 	sb.WriteString("\tout.Flush()\n")
 	sb.WriteString("}\n\n")
 
 	for name, body := range script.Functions {
-		fmt.Fprintf(&sb, "func %s(pkt *types.PacketData, vars map[string]string, arrays map[string][]string, out *bufio.Writer) bool {\n", name)
+		fmt.Fprintf(&sb, "func %s(pkt *types.PacketData, vars map[string]string, arrays map[string][]string, timers map[string]time.Time, out *bufio.Writer) bool {\n", name)
 		for _, ins := range body {
 			sb.WriteString(translateToGo(ins, 1))
 		}
 		sb.WriteString("\treturn false\n}\n\n")
 	}
 
-	sb.WriteString("func Execute(pkt *types.PacketData, vars map[string]string, arrays map[string][]string, out *bufio.Writer) bool {\n")
+	sb.WriteString("func Execute(pkt *types.PacketData, vars map[string]string, arrays map[string][]string, timers map[string]time.Time, out *bufio.Writer) bool {\n")
 	sb.WriteString("\t_ = pkt\n")
 	sb.WriteString("\t_ = vars\n")
 	sb.WriteString("\t_ = arrays\n")
+	sb.WriteString("\t_ = timers\n")
 	for _, ins := range script.Main {
 		sb.WriteString(translateToGo(ins, 1))
 	}
@@ -626,8 +650,21 @@ func GenerateGo(script types.CompiledScript) string {
 
 	if needsExpandVars {
 		sb.WriteString(`
+func convertMinecraftColors(input string) string {
+	if !strings.Contains(input, "&") { return input }
+	replacer := strings.NewReplacer(
+		"&0", "\x1b[30m", "&1", "\x1b[34m", "&2", "\x1b[32m", "&3", "\x1b[36m",
+		"&4", "\x1b[31m", "&5", "\x1b[35m", "&6", "\x1b[33m", "&7", "\x1b[37m",
+		"&8", "\x1b[90m", "&9", "\x1b[94m", "&a", "\x1b[92m", "&b", "\x1b[96m",
+		"&c", "\x1b[91m", "&d", "\x1b[95m", "&e", "\x1b[93m", "&f", "\x1b[97m",
+		"&l", "\x1b[1m", "&m", "\x1b[9m", "&n", "\x1b[4m", "&o", "\x1b[3m",
+		"&r", "\x1b[0m",
+	)
+	return replacer.Replace(input)
+}
+
 func expandVars(input string, vars map[string]string) string {
-	if !strings.Contains(input, "%") { return input }
+	if !strings.Contains(input, "%") { return convertMinecraftColors(input) }
 	var sb strings.Builder
 	curr := input
 	for {
@@ -676,7 +713,7 @@ func expandVars(input string, vars map[string]string) string {
 		}
 		curr = curr[end+1:]
 	}
-	return sb.String()
+	return convertMinecraftColors(sb.String())
 }
 `)
 	}
@@ -750,7 +787,7 @@ func translateToGo(ins types.Instruction, depth int) string {
 		for i, p := range parts {
 			if i%2 == 0 {
 				if p != "" {
-					fmt.Fprintf(&expansion, "%s%s.WriteString(%q)\n", indent, targetWriter, p)
+					fmt.Fprintf(&expansion, "%s%s.WriteString(%q)\n", indent, targetWriter, convertMinecraftColors(p))
 				}
 			} else {
 				switch p {
@@ -759,9 +796,9 @@ func translateToGo(ins types.Instruction, depth int) string {
 				case "CORE":
 					fmt.Fprintf(&expansion, "%s%s.Write(strconv.AppendInt(nil, int64(pkt.Core), 10))\n", indent, targetWriter)
 				default:
-					fmt.Fprintf(&expansion, "%sif v, ok := vars[%q]; ok { %s.WriteString(v) } else { %s.WriteString(\"%%%s%%\") }\n",
+					fmt.Fprintf(&expansion, "%sif v, ok := vars[%q]; ok { %s.WriteString(convertMinecraftColors(v)) } else { %s.WriteString(\"%%%s%%\") }\n",
 						indent, p, targetWriter, targetWriter, p)
-				} // How sinister
+				}
 			}
 		}
 		return expansion.String()
@@ -811,14 +848,33 @@ func translateToGo(ins types.Instruction, depth int) string {
 		return res
 
 	case types.OpTimerStart:
-		return fmt.Sprintf("%spkt.Timestamp = time.Now()\n", indent)
+		key := ins.Value
+		if key == "" {
+			key = "DEFAULT"
+		}
+		return fmt.Sprintf("%stimers[%q] = time.Now()\n", indent, key)
 	case types.OpTimerEnd:
-		return fmt.Sprintf("%svars[\"%s\"] = strconv.FormatFloat(time.Since(pkt.Timestamp).Seconds(), 'f', 9, 64)\n", indent, ins.Value)
+		key := ins.Value
+		if key == "" {
+			key = "DEFAULT"
+		}
+		return fmt.Sprintf("%svars[%q] = strconv.FormatFloat(time.Since(timers[%q]).Seconds(), 'f', 9, 64)\n", indent, ins.Value, key)
 	case types.OpTime:
 		return fmt.Sprintf("%svars[\"%s\"] = strconv.FormatFloat(float64(time.Now().UnixNano())/1e6, 'f', 9, 64)\n", indent, ins.Value)
+	case types.OpExec:
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\tcmd := exec.Command(\"sh\", \"-c\", expandVars(%q, vars))\n", indent, ins.Message)
+		if ins.Value != "" {
+			res += fmt.Sprintf("%s\tout, _ := cmd.CombinedOutput()\n", indent)
+			res += fmt.Sprintf("%s\tvars[%q] = strings.TrimSpace(string(out))\n", indent, ins.Value)
+		} else {
+			res += fmt.Sprintf("%s\tgo cmd.Run()\n", indent)
+		}
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
 	case types.OpSet:
 		if !strings.Contains(ins.Message, "%") {
-			return fmt.Sprintf("%svars[%q] = %q\n", indent, ins.Value, ins.Message)
+			return fmt.Sprintf("%svars[%q] = %q\n", indent, ins.Value, convertMinecraftColors(ins.Message))
 		}
 		return fmt.Sprintf("%svars[\"%s\"] = expandVars(%q, vars)\n", indent, ins.Value, ins.Message)
 	case types.OpSetExpr:
@@ -826,11 +882,11 @@ func translateToGo(ins types.Instruction, depth int) string {
 	case types.OpIncrement:
 		return fmt.Sprintf("%s{\n%s\tv, _ := strconv.Atoi(vars[\"%s\"])\n%s\tvars[\"%s\"] = strconv.Itoa(v + 1)\n%s}\n", indent, indent, ins.Value, indent, ins.Value, indent)
 	case types.OpIfCall:
-		return fmt.Sprintf("%sif %s { if %s(pkt, vars, arrays, out) { return true } }\n", indent, generateGoLogic(ins.Condition), ins.Message)
+		return fmt.Sprintf("%sif %s { if %s(pkt, vars, arrays, timers, out) { return true } }\n", indent, generateGoLogic(ins.Condition), ins.Message)
 	case types.OpIfBreak:
 		return fmt.Sprintf("%sif %s { break }\n", indent, generateGoLogic(ins.Condition))
 	case types.OpCall:
-		return fmt.Sprintf("%sif %s(pkt, vars, arrays, out) { return true }\n", indent, ins.Value)
+		return fmt.Sprintf("%sif %s(pkt, vars, arrays, timers, out) { return true }\n", indent, ins.Value)
 	case types.OpReadFile:
 		return fmt.Sprintf("%s{ data, _ := os.ReadFile(expandVars(%q, vars)); vars[%q] = string(data) }\n", indent, ins.Value, ins.Message)
 	case types.OpTokenize:
@@ -1009,4 +1065,19 @@ func evalMath(expr string) string {
 	}
 
 	return strconv.FormatFloat(total, 'f', 9, 64)
+}
+
+func convertMinecraftColors(input string) string {
+	if !strings.Contains(input, "&") {
+		return input
+	}
+	replacer := strings.NewReplacer(
+		"&0", "\x1b[30m", "&1", "\x1b[34m", "&2", "\x1b[32m", "&3", "\x1b[36m",
+		"&4", "\x1b[31m", "&5", "\x1b[35m", "&6", "\x1b[33m", "&7", "\x1b[37m",
+		"&8", "\x1b[90m", "&9", "\x1b[94m", "&a", "\x1b[92m", "&b", "\x1b[96m",
+		"&c", "\x1b[91m", "&d", "\x1b[95m", "&e", "\x1b[93m", "&f", "\x1b[97m",
+		"&l", "\x1b[1m", "&m", "\x1b[9m", "&n", "\x1b[4m", "&o", "\x1b[3m",
+		"&r", "\x1b[0m",
+	)
+	return replacer.Replace(input)
 }

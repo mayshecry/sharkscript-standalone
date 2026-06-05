@@ -19,14 +19,15 @@ func main() {
 		fmt.Println("Usage:")
 		fmt.Println("  shs <file.shark>          Compile to .shx")
 		fmt.Println("  shs <file.shx>            Execute bytecode")
-		fmt.Println("  shs --compile <file.shark>")
-		fmt.Println("  shs --run <file.shx>")
-		fmt.Println("  shs --aot <file.shark> [-os <target_os>]")
+		fmt.Println("  shs compile <file.shark>")
+		fmt.Println("  shs run <file.shx>")
+		fmt.Println("  shs aot <file.shark> [-os <target_os>]")
 		os.Exit(1)
 	}
 
 	var mode, file string
 	var extraArgsStart int
+	arg1 := strings.TrimPrefix(os.Args[1], "--")
 
 	if strings.HasPrefix(os.Args[1], "--") {
 		if len(os.Args) < 3 {
@@ -36,18 +37,23 @@ func main() {
 		mode = os.Args[1]
 		file = os.Args[2]
 		extraArgsStart = 3
+	} else if arg1 == "compile" || arg1 == "run" || arg1 == "aot" {
+		mode = arg1
+		file = os.Args[2]
+		extraArgsStart = 3
 	} else {
 		file = os.Args[1]
 		extraArgsStart = 2
 		if strings.HasSuffix(file, ".shark") {
-			mode = "--compile"
+			mode = "compile"
 		} else {
-			mode = "--run"
+			mode = "run"
 		}
 	}
+	mode = strings.TrimPrefix(mode, "--")
 
 	switch mode {
-	case "--compile":
+	case "compile":
 		err := compiler.Compile(file)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -55,7 +61,7 @@ func main() {
 		}
 		fmt.Printf("Compiled %s successfully.\n", file)
 
-	case "--aot":
+	case "aot":
 		targetOS := runtime.GOOS
 		for i := 1; i < len(os.Args); i++ {
 			if os.Args[i] == "-os" && i+1 < len(os.Args) {
@@ -69,7 +75,7 @@ func main() {
 		}
 		fmt.Printf("AOT Build complete.\n")
 
-	case "--run":
+	case "run":
 		f, err := os.Open(file)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
