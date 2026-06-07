@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,30 +18,34 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"sharkscript/pkg/types"
 )
 
 type Engine struct {
-	Filename          string
-	Instructions      []types.Instruction
-	Functions         map[string][]types.Instruction
-	Imports           map[string]bool
-	Vars              map[string]string
-	Arrays            map[string][]string
-	Headers           map[string]string
-	Timers            map[string]time.Time
-	mu                sync.RWMutex
-	out               *bufio.Writer
-	NumWorkers        int
-	outMu             sync.Mutex
-	UsesBypassTime    bool
-	bufferPool        sync.Pool
-	logPrefix         string
-	templateCache     sync.Map
-	corePrefixes      []string
-	corePrefixBytes   [][]byte
-	systemPrefixes    []string
-	systemPrefixBytes [][]byte
+	Filename            string
+	Instructions        []types.Instruction
+	Functions           map[string][]types.Instruction
+	Imports             map[string]bool
+	Vars                map[string]string
+	Arrays              map[string][]string
+	Headers             map[string]string
+	Timers              map[string]time.Time
+	mu                  sync.RWMutex
+	DiscordLimitChannel string
+	HasBackgroundTasks  bool
+	out                 *bufio.Writer
+	NumWorkers          int
+	outMu               sync.Mutex
+	UsesBypassTime      bool
+	bufferPool          sync.Pool
+	logPrefix           string
+	templateCache       sync.Map
+	corePrefixes        []string
+	corePrefixBytes     [][]byte
+	systemPrefixes      []string
+	systemPrefixBytes   [][]byte
 }
 
 type boundHandler struct {
@@ -132,7 +138,7 @@ func (e *Engine) bake(insts []types.Instruction) {
 		}
 		if len(ins.Body) > 0 {
 			e.bake(ins.Body)
-			if ins.Op == types.OpWhile || ins.Op == types.OpLoop || ins.Op == types.OpParallelLoop {
+			if ins.Op == types.OpWhile || ins.Op == types.OpLoop || ins.Op == types.OpParallelLoop || ins.Op == types.OpIfComplex {
 				bound := make([]boundHandler, len(ins.Body))
 				for j, bIns := range ins.Body {
 					bound[j] = boundHandler{h: opTable[bIns.Op], ins: bIns}
@@ -146,6 +152,9 @@ func (e *Engine) bake(insts []types.Instruction) {
 func (e *Engine) Run(pkt *types.PacketData) {
 	e.execute(e.Instructions, pkt)
 	e.out.Flush()
+	if e.HasBackgroundTasks {
+		select {}
+	}
 }
 
 type instructionHandler func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool
@@ -161,6 +170,16 @@ func init() {
 				break
 			}
 		}
+		return false
+	}
+	opTable[types.OpIfComplex] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if e.evalLogic(ins.Condition, pkt) {
+			*lastIfMet = true
+			boundBody, _ := ins.RuntimeState.([]boundHandler)
+			innerLastIf := false
+			return e.executeBound(boundBody, pkt, &innerLastIf)
+		}
+		*lastIfMet = false
 		return false
 	}
 	opTable[types.OpTimerStart] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -540,7 +559,7 @@ func init() {
 		if dur > 0 {
 			time.Sleep(dur)
 			elapsed := time.Since(startLoop)
-			msVal := strconv.FormatFloat(float64(elapsed.Nanoseconds())/1e6, 'f', 9, 64)
+			msVal := strconv.FormatFloat(float64(elapsed.Nanoseconds())/1e6, 'f', 18, 64)
 			e.mu.Lock()
 			e.Vars["BYPASS_TIME"] = msVal
 			if pkt != nil && pkt.LocalVars != nil {
@@ -963,6 +982,295 @@ func init() {
 		*lastIfMet = false
 		return false
 	}
+
+	opTable[types.OpServe] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if ins.Condition != nil && !e.evalLogic(ins.Condition, pkt) {
+			*lastIfMet = false
+			return false
+		}
+		*lastIfMet = true
+		e.HasBackgroundTasks = true
+		portArg, dirArg := ins.Value, ins.Message
+		if strings.Contains(ins.Message, ">") {
+			mParts := strings.SplitN(ins.Message, ">", 2)
+			portArg, dirArg = mParts[0], mParts[1]
+		}
+		rawPort := e.expandVars(portArg, pkt)
+		host := "127.0.0.1:"
+		port := rawPort
+		if strings.HasSuffix(rawPort, "|PUBLIC") {
+			host = ":"
+			port = strings.TrimSuffix(rawPort, "|PUBLIC")
+		}
+		dir := e.expandVars(dirArg, pkt)
+		if dir == "" {
+			dir = "./www"
+		}
+
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/", http.FileServer(http.Dir(dir)))
+			if err := http.ListenAndServe(host+port, mux); err != nil {
+				fmt.Printf("\033[31m[SERVE ERROR]\033[0m %v\n", err)
+			}
+		}()
+		return false
+	}
+
+	opTable[types.OpSetHeader] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		val := e.expandVars(ins.Message, pkt)
+		e.mu.Lock()
+		e.Headers[ins.Value] = val
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpFetch] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		url := e.expandVars(ins.Value, pkt)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return false
+		}
+		e.mu.RLock()
+		for k, v := range e.Headers {
+			req.Header.Set(k, v)
+		}
+		e.mu.RUnlock()
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Message] = string(b)
+		} else {
+			e.Vars[ins.Message] = string(b)
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpPost] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		mParts := strings.SplitN(ins.Message, "|", 2)
+		if len(mParts) < 2 {
+			return false
+		}
+		target, payload := mParts[0], e.expandVars(mParts[1], pkt)
+		url := e.expandVars(ins.Value, pkt)
+		req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+		if err != nil {
+			return false
+		}
+		e.mu.RLock()
+		for k, v := range e.Headers {
+			req.Header.Set(k, v)
+		}
+		e.mu.RUnlock()
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[target] = string(b)
+		} else {
+			e.Vars[target] = string(b)
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	genericHttp := func(method string) instructionHandler {
+		return func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+			target, body := ins.Message, ""
+			if strings.Contains(ins.Message, "|") {
+				parts := strings.SplitN(ins.Message, "|", 2)
+				target, body = parts[0], e.expandVars(parts[1], pkt)
+			}
+			url := e.expandVars(ins.Value, pkt)
+			req, _ := http.NewRequest(method, url, strings.NewReader(body))
+			e.mu.RLock()
+			for k, v := range e.Headers {
+				req.Header.Set(k, v)
+			}
+			e.mu.RUnlock()
+			resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+			if err != nil {
+				return false
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			e.mu.Lock()
+			if pkt != nil && pkt.LocalVars != nil {
+				pkt.LocalVars[target] = string(b)
+			} else {
+				e.Vars[target] = string(b)
+			}
+			e.mu.Unlock()
+			return false
+		}
+	}
+
+	opTable[types.OpPut] = genericHttp("PUT")
+	opTable[types.OpPatch] = genericHttp("PATCH")
+	opTable[types.OpDelete] = genericHttp("DELETE")
+
+	opTable[types.OpJsonExtract] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		src := e.expandVars(ins.Value, pkt)
+		mParts := strings.SplitN(ins.Message, "|", 2)
+		if len(mParts) < 2 {
+			return false
+		}
+		key := strings.Trim(e.expandVars(mParts[0], pkt), "\"")
+		target := mParts[1]
+
+		var data any
+		if err := json.Unmarshal([]byte(src), &data); err != nil {
+			return false
+		}
+
+		if arr, ok := data.([]any); ok && len(arr) > 0 {
+			data = arr[0]
+		}
+
+		val := ""
+		if m, ok := data.(map[string]any); ok {
+			if v, exists := m[key]; exists {
+				val = fmt.Sprint(v)
+			}
+		}
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[target] = val
+		} else {
+			e.Vars[target] = val
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpSubstring] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		src := e.expandVars(ins.Value, pkt)
+		parts := strings.SplitN(ins.Message, "|", 3)
+		start, _ := strconv.Atoi(e.expandVars(parts[0], pkt))
+		length, _ := strconv.Atoi(e.expandVars(parts[1], pkt))
+		target := parts[2]
+
+		val := ""
+		if start >= 0 && start < len(src) {
+			end := start + length
+			if end > len(src) {
+				end = len(src)
+			}
+			val = src[start:end]
+		}
+
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[target] = val
+		} else {
+			e.Vars[target] = val
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpDiscordConnect] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		e.HasBackgroundTasks = true
+		token := e.expandVars(ins.Value, pkt)
+
+		type gatewayEvent struct {
+			Op int             `json:"op"`
+			T  string          `json:"t"`
+			D  json.RawMessage `json:"d"`
+		}
+
+		go func() {
+			dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+			for {
+				conn, _, err := dialer.Dial("wss://gateway.discord.gg/?v=10&encoding=json", nil)
+				if err != nil {
+					time.Sleep(2 * time.Second)
+					continue
+				}
+
+				for {
+					_, message, err := conn.ReadMessage()
+					if err != nil {
+						conn.Close()
+						break
+					}
+
+					var ev gatewayEvent
+					if err := json.Unmarshal(message, &ev); err != nil {
+						continue
+					}
+
+					if ev.Op == 10 {
+						identify := fmt.Sprintf(`{"op":2,"d":{"token":"%s","intents":33281,"properties":{"$os":"linux","$browser":"shs","$device":"shs"},"presence":{"status":"online","afk":false}}}`, token)
+						conn.WriteMessage(websocket.TextMessage, []byte(identify))
+
+						var d map[string]float64
+						json.Unmarshal(ev.D, &d)
+						hbInterval := d["heartbeat_interval"]
+						go func() {
+							ticker := time.NewTicker(time.Duration(hbInterval) * time.Millisecond)
+							for range ticker.C {
+								if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"op":1, "d": null}`)); err != nil {
+									ticker.Stop()
+									return
+								}
+							}
+						}()
+					}
+
+					if ev.T == "MESSAGE_CREATE" {
+						var d map[string]any
+						json.Unmarshal(ev.D, &d)
+						cID, _ := d["channel_id"].(string)
+
+						e.mu.RLock()
+						limit := e.DiscordLimitChannel
+						e.mu.RUnlock()
+						if limit != "" && cID != limit {
+							continue
+						}
+
+						author, _ := d["author"].(map[string]any)
+						isBot := "false"
+						if b, ok := author["bot"].(bool); ok && b {
+							isBot = "true"
+						}
+						e.mu.Lock()
+						e.Vars["msg_content"], _ = d["content"].(string)
+						e.Vars["channel_id"] = cID
+						e.Vars["guild_id"], _ = d["guild_id"].(string)
+						e.Vars["msg_author_bot"] = isBot
+						e.Vars["msg_id"], _ = d["id"].(string)
+						e.mu.Unlock()
+						if f, ok := e.Functions["ON_MESSAGE"]; ok {
+							e.execute(f, pkt)
+						}
+					}
+				}
+				time.Sleep(time.Second)
+			}
+		}()
+		return false
+	}
+
+	opTable[types.OpDiscordLimit] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		e.mu.Lock()
+		e.DiscordLimitChannel = e.expandVars(ins.Value, pkt)
+		e.mu.Unlock()
+		return false
+	}
 }
 
 func (e *Engine) execute(insts []types.Instruction, pkt *types.PacketData) bool {
@@ -1033,16 +1341,47 @@ func (e *Engine) evalLogic(expr *types.LogicExpr, pkt *types.PacketData) bool {
 		return e.evalLogic(expr.Left, pkt) || e.evalLogic(expr.Right, pkt)
 	case types.LogAnd:
 		return e.evalLogic(expr.Left, pkt) && e.evalLogic(expr.Right, pkt)
-	case types.LogLt, types.LogGt, types.LogEq:
-		lv, _ := strconv.ParseFloat(e.resolveOperand(expr.Left), 64)
-		rv, _ := strconv.ParseFloat(e.resolveOperand(expr.Right), 64)
-		if expr.Op == types.LogLt {
-			return lv < rv
+	case types.LogLt, types.LogGt, types.LogEq, types.LogNe:
+		ls := e.resolveOperand(expr.Left)
+		rs := e.resolveOperand(expr.Right)
+
+		li, lErrI := strconv.ParseInt(ls, 10, 64)
+		ri, rErrI := strconv.ParseInt(rs, 10, 64)
+		if lErrI == nil && rErrI == nil {
+			switch expr.Op {
+			case types.LogLt:
+				return li < ri
+			case types.LogGt:
+				return li > ri
+			case types.LogEq:
+				return li == ri
+			case types.LogNe:
+				return li != ri
+			}
 		}
-		if expr.Op == types.LogGt {
-			return lv > rv
+
+		lf, lErrF := strconv.ParseFloat(ls, 64)
+		rf, rErrF := strconv.ParseFloat(rs, 64)
+		if lErrF == nil && rErrF == nil {
+			switch expr.Op {
+			case types.LogLt:
+				return lf < rf
+			case types.LogGt:
+				return lf > rf
+			case types.LogEq:
+				return lf == rf
+			case types.LogNe:
+				return lf != rf
+			}
 		}
-		return lv == rv
+
+		switch expr.Op {
+		case types.LogEq:
+			return ls == rs
+		case types.LogNe:
+			return ls != rs
+		}
+		return false
 	case types.LogMalicious:
 		return pkt.IsMalicious
 	case types.LogProto:
@@ -1120,7 +1459,7 @@ func (e *Engine) evalMath(expr string) string {
 			} else if right != 0 {
 				res = left / right
 			}
-			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 9, 64)
+			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 18, 64)
 		} else {
 			highPrec = append(highPrec, t)
 		}
@@ -1144,7 +1483,7 @@ func (e *Engine) evalMath(expr string) string {
 		}
 	}
 
-	return strconv.FormatFloat(total, 'f', 9, 64)
+	return strconv.FormatFloat(total, 'f', 18, 64)
 }
 
 func (e *Engine) parseTemplate(input string) []string {
@@ -1226,11 +1565,6 @@ func (e *Engine) writeExpanded(w io.Writer, ins *types.Instruction, pkt *types.P
 					e.mu.RUnlock()
 				}
 				if !vOk {
-					if sw != nil {
-						sw.WriteString("%" + p + "%")
-					} else {
-						w.Write([]byte("%" + p + "%"))
-					}
 				} else {
 					if sw != nil {
 						sw.WriteString(v)
@@ -1324,14 +1658,20 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 			}
 
 			if !ok {
-				sb.WriteByte('%')
-				sb.WriteString(key)
-				sb.WriteByte('%')
 			} else {
 				f, err := strconv.ParseFloat(val, 64)
 				if err == nil && f > 0 && f < 1 {
 					if strings.HasPrefix(curr[end+1:], "ms") {
-						if f < 0.001 {
+						if key == "BYPASS_TIME" {
+							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
+							sb.WriteString(" nanoseconds")
+						} else if f < 0.000000001 {
+							sb.WriteString(strconv.FormatFloat(f*1000000000000, 'f', 4, 64))
+							sb.WriteString(" femtoseconds")
+						} else if f < 0.000001 {
+							sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64))
+							sb.WriteString(" picoseconds")
+						} else if f < 0.001 {
 							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
 							sb.WriteString(" nanoseconds")
 						} else {
@@ -1343,7 +1683,13 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 					} else if strings.HasPrefix(curr[end+1:], "s") {
 						next := curr[end+1:]
 						if len(next) == 1 || next[1] == ' ' || next[1] == '\n' || next[1] == '\t' || next[1] == '.' || next[1] == ',' {
-							if f < 0.000001 {
+							if f < 0.000000000001 {
+								sb.WriteString(strconv.FormatFloat(f*1000000000000000, 'f', 4, 64))
+								sb.WriteString(" femtoseconds")
+							} else if f < 0.000000001 {
+								sb.WriteString(strconv.FormatFloat(f*1000000000000, 'f', 4, 64))
+								sb.WriteString(" picoseconds")
+							} else if f < 0.000001 {
 								sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64))
 								sb.WriteString(" nanoseconds")
 							} else if f < 0.001 {

@@ -65,6 +65,14 @@ const (
 	OpArraySet
 	OpArrayLen
 	OpIndexOf
+	OpServe
+	OpPut
+	OpPatch
+	OpDelete
+	OpJsonExtract
+	OpSubstring
+	OpDiscordConnect
+	OpDiscordLimit
 )
 
 type LogicOp uint8
@@ -76,6 +84,7 @@ const (
 	LogLt
 	LogGt
 	LogEq
+	LogNe
 	LogContains
 	LogProto
 	LogMalicious

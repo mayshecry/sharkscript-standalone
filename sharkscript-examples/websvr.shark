@@ -1,0 +1,4 @@
+SET port 80
+SERVE %port% ./www PUBLIC
+
+PRINT &aWeb Server initialized on :%port%

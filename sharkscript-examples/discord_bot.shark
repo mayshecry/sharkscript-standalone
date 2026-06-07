@@ -1,0 +1,66 @@
+# SharkScript High-Performance Discord Bot (WebSocket Edition)
+TIMER_START startup
+SET token PLACE_TOKEN_HERE
+
+SET_HEADER Authorization Bot %token%
+SET_HEADER Content-Type application/json
+SET_HEADER User-Agent SharkScript-Native/2.0
+
+PRINT "&b[SYSTEM] Initializing Multi-Server Bot..."
+print "&dDiscord bot succesfully started!"
+
+TIMER_END startup
+SET startup_ns = %startup% * 1000000000
+PRINT "&e[SYSTEM] Startup speed: %startup_ns% nanoseconds"
+
+# Uncomment below to restrict bot to a specific channel
+# DISCORD_LIMITTO_CHANNEL 123456789012345678
+
+# --- Phase 2: Event Logic ---
+FUNCTION ON_MESSAGE
+    # Ignore other bots
+    IF %msg_author_bot% == true BREAK
+
+    # 1. Handle !ping
+    IF %msg_content% == !ping
+        PRINT "&b[EVENT] Ping command detected in %channel_id%"
+        SET payload {"content": "Pong! 🏓\n**Mode:** `WebSocket Native`", "message_reference": {"message_id": "%msg_id%"}}
+        HTTP POST https://discord.com/api/v10/channels/%channel_id%/messages res %payload%
+    ENDIF
+
+    # 2. Handle !ban <id>
+    INDEX_OF %msg_content% !ban is_ban
+    IF %is_ban% == 0
+        TOKENIZE %msg_content% SPACE parts
+        ARRAY_GET parts 1 target_id
+        PRINT "&c[MOD] Banning %target_id% from %guild_id%"
+        HTTP PUT https://discord.com/api/v10/guilds/%guild_id%/bans/%target_id% res {"delete_message_seconds": 0}
+        SET log_msg {"content": "🔨 User `%target_id%` has been removed from the server.", "message_reference": {"message_id": "%msg_id%"}}
+        HTTP POST https://discord.com/api/v10/channels/%channel_id%/messages res %log_msg%
+    ENDIF
+
+    # 3. Handle !timeout <id>
+    INDEX_OF %msg_content% !timeout is_timeout
+    IF %is_timeout% == 0
+        TOKENIZE %msg_content% SPACE parts
+        ARRAY_GET parts 1 target_id
+        PRINT "&e[MOD] Timing out %target_id% in %guild_id%"
+        SET body {"communication_disabled_until": "2025-01-01T00:00:00Z"}
+        HTTP PATCH https://discord.com/api/v10/guilds/%guild_id%/members/%target_id% res %body%
+        SET log_msg {"content": "⏳ User `%target_id%` timed out until 2025.", "message_reference": {"message_id": "%msg_id%"}}
+        HTTP POST https://discord.com/api/v10/channels/%channel_id%/messages res %log_msg%
+    ENDIF
+
+    # 4. Handle !loop benchmark
+    IF %msg_content% == !loop
+        PRINT "&b[EVENT] Benchmark command detected"
+        PARALLEL LOOP 1000000
+        ENDLOOP
+        SET per_it = %BYPASS_TIME% / 1000000
+        SET payload {"content": "🚀 **SharkScript Performance Report**\nThis benchmark executed 1,000,000 lock-free parallel iterations across all available CPU cores to measure synchronization and opcode overhead.\n\n- **Total Bypass Latency:** `%BYPASS_TIME%ms` (Total time to spawn workers and aggregate results)\n- **Time per Itteration:** `%per_it%ms` (Average clock cycle cost per individual loop iteration)\n\n**Analysis:** Your environment is currently operating at sub-nanosecond speeds. This demonstrates the zero-overhead nature of the LIGMA02 specification, making it ideal for microsecond-sensitive automation."}
+        HTTP POST https://discord.com/api/v10/channels/%channel_id%/messages res %payload%
+    ENDIF
+ENDFUNCTION
+
+# --- Phase 3: Connect and Idle ---
+DISCORD_CONNECT %token%
