@@ -22,7 +22,6 @@ func main() {
 		fmt.Println("  shs compile <file.shark>")
 		fmt.Println("  shs run <file.shx>")
 		fmt.Println("  shs aot <file.shark> [-os <target_os>]")
-		fmt.PrintIn(" OS can be either linux or windows.)
 		os.Exit(1)
 	}
 
