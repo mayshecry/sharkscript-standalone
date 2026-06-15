@@ -9,15 +9,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"sharkscript/pkg/types"
 )
 
-func Compile(srcPath string) error {
+func Compile(srcPath string, noOptimize bool) error {
 	fmt.Printf("Initializing Build: %s\n", srcPath)
 
-	script, lineNum, err := Parse(srcPath)
+	script, lineNum, tips, err := Parse(srcPath, noOptimize)
 	if err != nil {
 		return err
 	}
@@ -35,21 +36,59 @@ func Compile(srcPath string) error {
 		return fmt.Errorf("failed to encode bytecode: %w", err)
 	}
 
-	fmt.Printf("✔ Bytecode Exported: %s\n", destPath)
-	printSuccess(srcPath, destPath, lineNum, script)
+	fmt.Printf("[SUCCESS] Bytecode Exported: %s\n", destPath)
+	if !noOptimize {
+		script.Main = optimizePeephole(script.Main)
+		script.Main = unrollLoops(script.Main)
+		if lineNum > 2000 {
+			fmt.Printf("[SYSTEM] Large source detected (%d lines). Multi-threaded compilation active.\n", lineNum)
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+
+			mMain, mTips := mergePrints(script.Main)
+			script.Main = mMain
+			tips = append(tips, mTips...)
+
+			for name, fn := range script.Functions {
+				wg.Add(1)
+				go func(n string, f []types.Instruction) {
+					defer wg.Done()
+					optFn, optTips := mergePrints(unrollLoops(optimizePeephole(f)))
+					mu.Lock()
+					script.Functions[n] = optFn
+					tips = append(tips, optTips...)
+					mu.Unlock()
+				}(name, fn)
+			}
+			wg.Wait()
+		} else {
+			mMain, mTips := mergePrints(script.Main)
+			script.Main = mMain
+			tips = append(tips, mTips...)
+			for name, fn := range script.Functions {
+				mFn, fTips := mergePrints(unrollLoops(optimizePeephole(fn)))
+				script.Functions[name] = mFn
+				tips = append(tips, fTips...)
+			}
+		}
+		optimizedTips := optimizeUnusedVariables(&script)
+		tips = append(tips, optimizedTips...)
+	}
+	printSuccess(srcPath, destPath, lineNum, script, tips, noOptimize)
 	return nil
 }
 
-func Parse(srcPath string) (types.CompiledScript, int, error) {
+func Parse(srcPath string, noOptimize bool) (types.CompiledScript, int, []string, error) {
 	src, err := os.Open(srcPath)
 	if err != nil {
-		return types.CompiledScript{}, 0, fmt.Errorf("failed to open source file: %w", err)
+		return types.CompiledScript{}, 0, nil, fmt.Errorf("failed to open source file: %w", err)
 	}
 	defer src.Close()
 
 	fmt.Printf("[Parsing Source] - %s\n", srcPath)
 	scanner := bufio.NewScanner(src)
 	lineNum := 0
+	tips := []string{}
 
 	functions := make(map[string][]types.Instruction)
 	imports := []string{}
@@ -146,11 +185,17 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			if v, err := strconv.Atoi(ins.Value); err == nil {
 				ins.IntValue = v
 			}
+			if ins.Op == types.OpPrint || ins.Op == types.OpIfPrint || ins.Op == types.OpSystem || ins.Op == types.OpLog {
+				ins.Message = convertMinecraftColors(strings.ReplaceAll(ins.Message, "\\033", "\x1b"))
+			}
 		}
 
 		if hasVarInMsg {
 			ins.Message = strings.ReplaceAll(ins.Message, "\\033", "\x1b")
 			ins.TemplateParts = parseTemplate(ins.Message)
+		}
+		if hasVarInVal {
+			ins.Value = strings.ReplaceAll(ins.Value, "\\033", "\x1b")
 		}
 
 		if ins.Op == types.OpWhile || (ins.Op >= types.OpIfPrint && ins.Op <= types.OpIfBreak) || ins.Op == types.OpIfComplex {
@@ -160,7 +205,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			}
 		}
 
-		if ins.Op == types.OpSetExpr && ins.IsStatic {
+		if !noOptimize && ins.Op == types.OpSetExpr && ins.IsStatic {
 			ins.Message = evalMath(ins.Message)
 			ins.Op = types.OpSet
 		}
@@ -190,7 +235,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "LOOP" {
 			if len(parts) < 2 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: LOOP requires a count", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: LOOP requires a count", lineNum)
 			}
 			stack = append(stack, []types.Instruction{})
 			ctrlStack = append(ctrlStack, control{op: "LOOP", val: parts[1]})
@@ -199,7 +244,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "PARALLEL" && len(parts) > 1 && strings.ToUpper(parts[1]) == "LOOP" {
 			if len(parts) < 3 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: PARALLEL LOOP requires a count", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: PARALLEL LOOP requires a count", lineNum)
 			}
 			stack = append(stack, []types.Instruction{})
 			ctrlStack = append(ctrlStack, control{op: "PARALLEL_LOOP", val: parts[2]})
@@ -208,7 +253,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "ENDLOOP" {
 			if len(ctrlStack) == 0 || (ctrlStack[len(ctrlStack)-1].op != "LOOP" && ctrlStack[len(ctrlStack)-1].op != "PARALLEL_LOOP") {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ENDLOOP without LOOP", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ENDLOOP without LOOP", lineNum)
 			}
 			body := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
@@ -222,18 +267,32 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 				}
 			}
 
-			if op == types.OpParallelLoop && ctrl.val != "" {
+			if !noOptimize && op == types.OpLoop && ctrl.val != "" {
+				if count, err := strconv.Atoi(ctrl.val); err == nil && count >= 10000 {
+					op = types.OpParallelLoop
+					tips = append(tips, fmt.Sprintf("Line %d: Automatically parallelized large loop (%s iterations)", lineNum, ctrl.val))
+				}
+			}
+
+			if !noOptimize && op == types.OpParallelLoop && ctrl.val != "" {
 				if count, err := strconv.Atoi(ctrl.val); err == nil && count > 0 && count < 128 {
 					op = types.OpLoop
+					tips = append(tips, fmt.Sprintf("Line %d: Downgraded small parallel loop to sequential for better performance", lineNum))
 				}
 			}
 
 			ins := types.Instruction{Op: op, Value: ctrl.val, Body: body, NeedsIteration: containsIter(body)}
-			if len(body) == 1 && body[0].Op == types.OpPrint {
+			if !noOptimize && len(body) == 1 && body[0].Op == types.OpPrint {
+				switch op {
+				case types.OpLoop:
+					tips = append(tips, fmt.Sprintf("Line %d: Optimized loop to high-speed single-instruction mode", lineNum))
+				case types.OpParallelLoop:
+					tips = append(tips, fmt.Sprintf("Line %d: Optimized parallel loop to high-speed buffered mode", lineNum))
+				}
 				ins.IsSinglePrintLoop = true
 			}
 			if err := prepare(&ins); err != nil {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: %v", lineNum, err)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: %v", lineNum, err)
 			}
 			stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 			continue
@@ -247,7 +306,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "ENDWHILE" {
 			if len(ctrlStack) == 0 || ctrlStack[len(ctrlStack)-1].op != "WHILE" {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ENDWHILE without WHILE", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ENDWHILE without WHILE", lineNum)
 			}
 			body := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
@@ -255,7 +314,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			ctrlStack = ctrlStack[:len(ctrlStack)-1]
 			ins := types.Instruction{Op: types.OpWhile, Value: ctrl.val, Body: body}
 			if err := prepare(&ins); err != nil {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: %v", lineNum, err)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: %v", lineNum, err)
 			}
 			stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 			continue
@@ -263,15 +322,33 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "ENDIF" {
 			if len(ctrlStack) == 0 || ctrlStack[len(ctrlStack)-1].op != "IF" {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ENDIF without IF", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ENDIF without IF", lineNum)
 			}
+
 			body := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 			ctrl := ctrlStack[len(ctrlStack)-1]
 			ctrlStack = ctrlStack[:len(ctrlStack)-1]
+
+			if !noOptimize && len(body) == 0 {
+				tips = append(tips, fmt.Sprintf("Line %d: Automatically removed empty IF block", lineNum))
+				continue
+			}
+
+			if !noOptimize && len(body) == 1 && body[0].Op == types.OpPrint {
+				pIns := body[0]
+				ins := types.Instruction{Op: types.OpIfPrint, Value: ctrl.val, Message: pIns.Message}
+				tips = append(tips, fmt.Sprintf("Line %d: Inlined single PRINT instruction into IF condition", lineNum))
+				if err := prepare(&ins); err != nil {
+					return types.CompiledScript{}, lineNum, nil, err
+				}
+				stack[len(stack)-1] = append(stack[len(stack)-1], ins)
+				continue
+			}
+
 			ins := types.Instruction{Op: types.OpIfComplex, Value: ctrl.val, Body: body}
 			if err := prepare(&ins); err != nil {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: %v", lineNum, err)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: %v", lineNum, err)
 			}
 			stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 			continue
@@ -279,10 +356,10 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "FUNCTION" {
 			if len(parts) < 2 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: FUNCTION requires a name", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: FUNCTION requires a name", lineNum)
 			}
 			if _, exists := functions[parts[1]]; exists {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: redeclaration of function '%s'", lineNum, parts[1])
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: redeclaration of function '%s'", lineNum, parts[1])
 			}
 			stack = append(stack, []types.Instruction{})
 			ctrlStack = append(ctrlStack, control{op: "FUNCTION", name: parts[1]})
@@ -291,7 +368,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 
 		if cmd == "ENDFUNCTION" {
 			if len(ctrlStack) == 0 || ctrlStack[len(ctrlStack)-1].op != "FUNCTION" {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ENDFUNCTION without FUNCTION", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ENDFUNCTION without FUNCTION", lineNum)
 			}
 			body := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
@@ -316,15 +393,15 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			}
 		case "TIMER_END":
 			if len(parts) < 2 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: TIMER_END requires a target variable name", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: TIMER_END requires a target variable name", lineNum)
 			}
 			ins.Op, ins.Value = types.OpTimerEnd, parts[1]
 		case "SET":
 			if len(parts) < 3 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: SET requires var and val", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: SET requires var and val", lineNum)
 			}
 			if err := validateVar(parts[1], lineNum); err != nil {
-				return types.CompiledScript{}, lineNum, err
+				return types.CompiledScript{}, lineNum, nil, err
 			}
 			val := strings.Join(parts[2:], " ")
 			if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
@@ -341,7 +418,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			ins.Op, ins.Value, ins.Message = types.OpGetHeader, parts[1], parts[2]
 		case "SET_HEADER":
 			if err := validateVar(parts[1], lineNum); err != nil {
-				return types.CompiledScript{}, lineNum, err
+				return types.CompiledScript{}, lineNum, nil, err
 			}
 			ins.Op, ins.Value, ins.Message = types.OpSetHeader, parts[1], strings.Join(parts[2:], " ")
 		case "TIME":
@@ -350,18 +427,19 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			ins.Op, ins.Value = types.OpIncrement, parts[1]
 		case "HTTP":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: HTTP requires method, URL and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: HTTP requires method, URL and target_var", lineNum)
 			}
 			method := strings.ToUpper(parts[1])
 			url, target := parts[2], parts[3]
-			if method == "GET" {
+			switch method {
+			case "GET":
 				ins.Op, ins.Value, ins.Message = types.OpFetch, url, target
-			} else if method == "POST" {
+			case "POST":
 				ins.Op, ins.Value = types.OpPost, url
 				uIdx := strings.Index(rawLine, url)
 				tIdx := strings.Index(rawLine[uIdx+len(url):], target)
 				ins.Message = target + "|" + strings.TrimSpace(rawLine[uIdx+len(url)+tIdx+len(target):])
-			} else if method == "PUT" || method == "PATCH" || method == "DELETE" {
+			case "PUT", "PATCH", "DELETE":
 				switch method {
 				case "PUT":
 					ins.Op = types.OpPut
@@ -377,7 +455,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			}
 		case "IF":
 			if len(parts) < 3 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: IF missing arguments", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: IF missing arguments", lineNum)
 			}
 
 			actionIdx := -1
@@ -393,7 +471,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			if actionIdx == -1 {
 				ins.Value = strings.Join(parts[1:], " ")
 				if ins.Value == "" {
-					return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: IF block requires a condition", lineNum)
+					return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: IF block requires a condition", lineNum)
 				}
 				stack = append(stack, []types.Instruction{})
 				ctrlStack = append(ctrlStack, control{op: "IF", val: ins.Value})
@@ -413,7 +491,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 				if len(parts) > actionIdx+3 {
 					ins.Message = parts[actionIdx+1] + " " + parts[actionIdx+2] + " " + strings.Join(parts[actionIdx+3:], " ")
 				} else {
-					return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: IF ... HTTP requires method, URL and target_var", lineNum)
+					return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: IF ... HTTP requires method, URL and target_var", lineNum)
 				}
 			} else {
 				action := strings.ToUpper(parts[actionIdx])
@@ -435,35 +513,35 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 					ins.Op = types.OpInput
 					ins.Condition = compileLogic(ins.Value, "")
 					if ins.Condition == nil {
-						return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: invalid condition expression: '%s'", lineNum, ins.Value)
+						return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: invalid condition expression: '%s'", lineNum, ins.Value)
 					}
 					if len(parts) > actionIdx+2 {
 						ins.Value = parts[actionIdx+1]
 						ins.Message = strings.Join(parts[actionIdx+2:], " ")
 					} else {
-						return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: IF ... INPUT requires a target variable", lineNum)
+						return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: IF ... INPUT requires a target variable", lineNum)
 					}
 				case "SEARCH":
 					ins.Op = types.OpSearch
 					ins.Condition = compileLogic(ins.Value, "")
 					if ins.Condition == nil {
-						return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: invalid condition expression: '%s'", lineNum, ins.Value)
+						return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: invalid condition expression: '%s'", lineNum, ins.Value)
 					}
 					if len(parts) > actionIdx+3 {
 						ins.Value = parts[actionIdx+2]
 						ins.Message = parts[actionIdx+1] + "|" + strings.Join(parts[actionIdx+3:], " ")
 					} else {
-						return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: IF ... SEARCH requires path, target_var and pattern", lineNum)
+						return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: IF ... SEARCH requires path, target_var and pattern", lineNum)
 					}
 				case "SERVE":
 					ins.Op = types.OpServe
 					ins.Condition = compileLogic(ins.Value, "")
 					if ins.Condition == nil {
-						return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: invalid condition expression: '%s'", lineNum, ins.Value)
+						return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: invalid condition expression: '%s'", lineNum, ins.Value)
 					}
 					args := parts[actionIdx+1:]
 					if len(args) < 1 {
-						return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: IF ... SERVE requires a port", lineNum)
+						return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: IF ... SERVE requires a port", lineNum)
 					}
 					port := args[0]
 					dir := ""
@@ -484,7 +562,7 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			}
 		case "ELSE":
 			if !lastWasIf {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ELSE must follow an IF statement", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ELSE must follow an IF statement", lineNum)
 			}
 			ins.Op = types.OpElse
 			action := strings.ToUpper(parts[1])
@@ -521,13 +599,13 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 		case "INPUT":
 			if len(parts) >= 2 {
 				if err := validateVar(parts[1], lineNum); err != nil {
-					return types.CompiledScript{}, lineNum, err
+					return types.CompiledScript{}, lineNum, nil, err
 				}
 				ins.Op = types.OpInput
 				ins.Value = parts[1]
 				ins.Message = strings.Join(parts[2:], " ")
 			} else {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: INPUT requires a target variable", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: INPUT requires a target variable", lineNum)
 			}
 		case "GET_ISP":
 			ins.Op, ins.Value, ins.Message = types.OpGetISP, parts[1], parts[2]
@@ -535,56 +613,56 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			ins.Op = types.OpBlock
 		case "SEARCH":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: SEARCH requires path, target_var and pattern", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: SEARCH requires path, target_var and pattern", lineNum)
 			}
 			ins.Op = types.OpSearch
 			ins.Value = parts[2]
 			ins.Message = parts[1] + "|" + strings.Join(parts[3:], " ")
 		case "READ_FILE":
 			if len(parts) < 3 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: READ_FILE requires path and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: READ_FILE requires path and target_var", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpReadFile, parts[1], parts[2]
 		case "TOKENIZE":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: TOKENIZE requires source, delimiter, and target_array", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: TOKENIZE requires source, delimiter, and target_array", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpTokenize, parts[1], parts[2]+"|"+parts[3]
 		case "ARRAY_GET":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ARRAY_GET requires array, index, and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ARRAY_GET requires array, index, and target_var", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpArrayGet, parts[1], parts[2]+"|"+parts[3]
 		case "ARRAY_SET":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ARRAY_SET requires array, index, and value", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ARRAY_SET requires array, index, and value", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpArraySet, parts[1], parts[2]+"|"+strings.Join(parts[3:], " ")
 		case "ARRAY_LEN":
 			if len(parts) < 3 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: ARRAY_LEN requires array and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: ARRAY_LEN requires array and target_var", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpArrayLen, parts[1], parts[2]
 		case "INDEX_OF":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: INDEX_OF requires source, search_term, and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: INDEX_OF requires source, search_term, and target_var", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpIndexOf, parts[1], parts[2]+"|"+parts[3]
 		case "SUBSTRING":
 			if len(parts) < 5 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: SUBSTRING requires source, start, length, and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: SUBSTRING requires source, start, length, and target_var", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpSubstring, parts[1], parts[2]+"|"+parts[3]+"|"+parts[4]
 		case "JSON_EXTRACT":
 			if len(parts) < 4 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: JSON_EXTRACT requires source, key, and target_var", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: JSON_EXTRACT requires source, key, and target_var", lineNum)
 			}
 			ins.Op, ins.Value, ins.Message = types.OpJsonExtract, parts[1], parts[2]+"|"+parts[3]
 		case "SYSTEM":
 			ins.Op, ins.Message = types.OpSystem, strings.Join(parts[1:], " ")
 		case "SERVE":
 			if len(parts) < 2 {
-				return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: SERVE requires a port", lineNum)
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: SERVE requires a port", lineNum)
 			}
 			ins.Op, ins.Value = types.OpServe, parts[1]
 			if len(parts) > 2 {
@@ -613,52 +691,89 @@ func Parse(srcPath string) (types.CompiledScript, int, error) {
 			ins.Op = types.OpNuke
 		case "DISCORD_CONNECT":
 			ins.Op, ins.Value = types.OpDiscordConnect, parts[1]
+		case "SYS_WRITE":
+			ins.Op, ins.Message = types.OpSysWrite, strings.Join(parts[1:], " ")
+		case "SYS_READ_FILE":
+			if len(parts) < 3 {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: SYS_READ_FILE requires filename and target variable", lineNum)
+			}
+			ins.Op, ins.Value, ins.Message = types.OpSysReadFile, parts[1], parts[2]
+		case "SYS_EXIT":
+			ins.Op = types.OpSysExit
+			if len(parts) > 1 {
+				ins.Value = parts[1]
+			}
+		case "SYS_YIELD":
+			ins.Op = types.OpSysYield
 		case "BashKILL_PID":
 			ins.Op = types.OpBashKill
 		default:
-			return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: unknown command '%s'", lineNum, cmd)
+			if strings.HasPrefix(parts[0], "%") && len(parts) >= 3 && parts[1] == "=" {
+				varName := strings.Trim(parts[0], "%")
+				if err := validateVar(varName, lineNum); err != nil {
+					return types.CompiledScript{}, lineNum, nil, err
+				}
+				ins.Op = types.OpSetExpr
+				ins.Value = varName
+				ins.Message = strings.Join(parts[2:], " ")
+			} else {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: unknown command '%s'", lineNum, cmd)
+			}
 		}
 
 		lastWasIf = currentIsIf
 		if err := prepare(&ins); err != nil {
-			return types.CompiledScript{}, lineNum, fmt.Errorf("line %d: %v", lineNum, err)
+			return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: %v", lineNum, err)
 		}
 		stack[len(stack)-1] = append(stack[len(stack)-1], ins)
 	}
 
 	if err := scanner.Err(); err != nil {
-		return types.CompiledScript{}, lineNum, fmt.Errorf("failed reading source: %w", err)
+		return types.CompiledScript{}, lineNum, nil, fmt.Errorf("failed reading source: %w", err)
 	}
 
 	if len(ctrlStack) > 0 {
 		last := ctrlStack[len(ctrlStack)-1]
-		return types.CompiledScript{}, lineNum, fmt.Errorf("syntax error: unclosed block type '%s' (name: %s, val: %s)", last.op, last.name, last.val)
+		return types.CompiledScript{}, lineNum, nil, fmt.Errorf("syntax error: unclosed block type '%s' (name: %s, val: %s)", last.op, last.name, last.val)
 	}
 
-	return types.CompiledScript{
+	script := types.CompiledScript{
 		Main:           stack[0],
 		Functions:      functions,
 		Imports:        imports,
 		UsesBypassTime: usesBypass,
-	}, lineNum, nil
+	}
+
+	return script, lineNum, tips, nil
 }
 
-func printSuccess(_, destPath string, lineNum int, script types.CompiledScript) {
+func printSuccess(_, destPath string, lineNum int, script types.CompiledScript, tips []string, noOptimize bool) {
 	totalInstructions := len(script.Main)
 	for _, fn := range script.Functions {
 		totalInstructions += len(fn)
 	}
-	fmt.Printf("\n--- SharkScript Build Successful --- \n")
-	fmt.Printf("Target:       %s\n", destPath)
-	fmt.Printf("Size:         %d lines -> %d opcodes\n", lineNum, totalInstructions)
-	fmt.Printf("Functions:    %d defined\n", len(script.Functions))
-	fmt.Printf("Optimizations: Constant Folding, Loop-Unrolling, Parallel-Downgrade, Empty-Loop-Bypass\n")
-	fmt.Printf("Build Mode:   [OPTIMIZED MAX PERFORMANCE]\n")
+	fmt.Printf("\n[BUILD SUMMARY]\n")
+	fmt.Printf("  Target:     %s\n", destPath)
+	fmt.Printf("  Binary:     %d lines -> %d opcodes\n", lineNum, totalInstructions)
+	fmt.Printf("  Functions:  %d local definitions\n", len(script.Functions))
+	if noOptimize {
+		fmt.Printf("  Optimizations: Disabled [-fo flag active]\n")
+	} else {
+		fmt.Printf("  Optimizations: Enabled [AOT, Loop-Parallelization, Block-Inlining, Static-Math]\n")
+	}
+	fmt.Printf("  Engine:     SHARK01 [MAXIMUM PERFORMANCE]\n")
+
+	if len(tips) > 0 {
+		fmt.Printf("\n[OPTIMIZATIONS APPLIED]\n")
+		for _, tip := range tips {
+			fmt.Printf("  * %s\n", tip)
+		}
+	}
 	fmt.Printf("-----------------------------------------\n\n")
 }
 
-func CompileAOT(srcPath string, targetOS string) error {
-	script, lineNum, err := Parse(srcPath)
+func CompileAOT(srcPath string, targetOS string, noOptimize bool) error {
+	script, lineNum, tips, err := Parse(srcPath, noOptimize)
 	if err != nil {
 		return err
 	}
@@ -678,7 +793,7 @@ func CompileAOT(srcPath string, targetOS string) error {
 		outputBin += ".exe"
 	}
 
-	fmt.Println("[Invoking Native Toolchain] - Go 1.21+ Backend")
+	fmt.Println("[Invoking Native Toolchain] - SharkScript AOTV2")
 	cmd := exec.Command("go", "build", "-ldflags=-s -w", "-o", outputBin, tmpFile)
 	cmd.Env = append(os.Environ(), "GOOS="+targetOS)
 
@@ -686,8 +801,202 @@ func CompileAOT(srcPath string, targetOS string) error {
 		return fmt.Errorf("AOT Build Failed: %s\n%s", err, string(out))
 	}
 
-	printSuccess(srcPath, outputBin+" (NATIVE)", lineNum, script)
+	if !noOptimize {
+		if lineNum > 2000 {
+			fmt.Printf("[SYSTEM] Large source detected (%d lines). Multi-threaded AOT optimization active.\n", lineNum)
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+
+			mMain, mTips := mergePrints(script.Main)
+			script.Main = mMain
+			tips = append(tips, mTips...)
+
+			for name, fn := range script.Functions {
+				wg.Add(1)
+				go func(n string, f []types.Instruction) {
+					defer wg.Done()
+					optFn, optTips := mergePrints(unrollLoops(optimizePeephole(f)))
+					mu.Lock()
+					script.Functions[n] = optFn
+					tips = append(tips, optTips...)
+					mu.Unlock()
+				}(name, fn)
+			}
+			wg.Wait()
+		} else {
+			mMain, mTips := mergePrints(script.Main)
+			script.Main = mMain
+			tips = append(tips, mTips...)
+			for name, fn := range script.Functions {
+				mFn, fTips := mergePrints(unrollLoops(optimizePeephole(fn)))
+				script.Functions[name] = mFn
+				tips = append(tips, fTips...)
+			}
+		}
+		optimizedTips := optimizeUnusedVariables(&script)
+		tips = append(tips, optimizedTips...)
+	}
+
+	printSuccess(srcPath, outputBin+" (NATIVE)", lineNum, script, tips, noOptimize)
 	return nil
+}
+
+func unrollLoops(insts []types.Instruction) []types.Instruction {
+	out := make([]types.Instruction, 0, len(insts))
+	for _, ins := range insts {
+		if ins.Op == types.OpLoop && ins.IsStatic && ins.IntValue > 0 && ins.IntValue <= 8 {
+			for i := 0; i < ins.IntValue; i++ {
+				iterStr := strconv.Itoa(i)
+				for _, bIns := range ins.Body {
+					cloned := bIns
+					cloned.Message = strings.ReplaceAll(cloned.Message, "%ITER%", iterStr)
+					cloned.Value = strings.ReplaceAll(cloned.Value, "%ITER%", iterStr)
+					if len(cloned.Body) > 0 {
+						cloned.Body = unrollLoops(cloned.Body)
+					}
+					out = append(out, cloned)
+				}
+			}
+			continue
+		}
+		if len(ins.Body) > 0 {
+			ins.Body = unrollLoops(ins.Body)
+		}
+		out = append(out, ins)
+	}
+	return out
+}
+
+func optimizePeephole(insts []types.Instruction) []types.Instruction {
+	if len(insts) < 2 {
+		return insts
+	}
+
+	out := make([]types.Instruction, 0, len(insts))
+	for i := 0; i < len(insts); i++ {
+		ins := insts[i]
+
+		// Detect Math Loop Pattern: [PARALLEL] LOOP N { %X% = (%X% * A + B) % M }
+		if (ins.Op == types.OpLoop || ins.Op == types.OpParallelLoop) && len(ins.Body) == 1 {
+			isParallel := ins.Op == types.OpParallelLoop
+			body := ins.Body[0]
+			if body.Op == types.OpSetExpr && strings.Contains(body.Message, "%"+ins.Value+"%") {
+				// Basic detection for LCG-style math loops
+				// We transform this into a single OpMathLoop instruction
+				count, _ := strconv.Atoi(ins.Value)
+				if count == 0 {
+					count = ins.IntValue
+				}
+
+				newIns := types.Instruction{
+					Op:             types.OpMathLoop,
+					Value:          body.Value,   // The variable being modified
+					Message:        body.Message, // The raw expression
+					IntValue:       count,
+					IsStatic:       true,
+					NeedsIteration: isParallel, // Flag for parallel execution
+				}
+				out = append(out, newIns)
+				continue
+			}
+		}
+
+		if i+1 < len(insts) {
+			next := insts[i+1]
+
+			if ins.Op == types.OpSet && next.Op == types.OpIncrement && ins.Value == next.Value {
+				if val, err := strconv.Atoi(ins.Message); err == nil {
+					ins.Message = strconv.Itoa(val + 1)
+					out = append(out, ins)
+					i++
+					continue
+				}
+			}
+
+			if (ins.Op == types.OpSet || ins.Op == types.OpSetExpr) &&
+				(next.Op == types.OpSet || next.Op == types.OpSetExpr) &&
+				ins.Value == next.Value {
+				continue
+			}
+		}
+
+		if len(ins.Body) > 0 {
+			ins.Body = optimizePeephole(ins.Body)
+		}
+		out = append(out, ins)
+	}
+	return out
+}
+
+func optimizeUnusedVariables(script *types.CompiledScript) []string {
+	reads := make(map[string]bool)
+
+	trackReads := func(s string) {
+		if !strings.Contains(s, "%") {
+			return
+		}
+		parts := parseTemplate(s)
+		for i := 1; i < len(parts); i += 2 {
+			reads[parts[i]] = true
+		}
+	}
+
+	var findReads func([]types.Instruction)
+	findReads = func(insts []types.Instruction) {
+		for _, ins := range insts {
+			trackReads(ins.Message)
+			trackReads(ins.Value)
+
+			if ins.Condition != nil {
+				var walkLogic func(*types.LogicExpr)
+				walkLogic = func(l *types.LogicExpr) {
+					if l == nil {
+						return
+					}
+					if l.Op == types.LogVar {
+						reads[l.Value] = true
+					}
+					walkLogic(l.Left)
+					walkLogic(l.Right)
+				}
+				walkLogic(ins.Condition)
+			}
+			if ins.Op == types.OpIncrement {
+				reads[ins.Value] = true
+			}
+			if len(ins.Body) > 0 {
+				findReads(ins.Body)
+			}
+		}
+	}
+	findReads(script.Main)
+	for _, f := range script.Functions {
+		findReads(f)
+	}
+
+	var tips []string
+	var sweep func([]types.Instruction) []types.Instruction
+	sweep = func(insts []types.Instruction) []types.Instruction {
+		out := make([]types.Instruction, 0, len(insts))
+		for _, ins := range insts {
+			if len(ins.Body) > 0 {
+				ins.Body = sweep(ins.Body)
+			}
+			if (ins.Op == types.OpSet || ins.Op == types.OpSetExpr || ins.Op == types.OpTimerEnd) && ins.Value != "" {
+				if !reads[ins.Value] {
+					tips = append(tips, fmt.Sprintf("Removed unused assignment to variable '%s'", ins.Value))
+					continue
+				}
+			}
+			out = append(out, ins)
+		}
+		return out
+	}
+	script.Main = sweep(script.Main)
+	for name, f := range script.Functions {
+		script.Functions[name] = sweep(f)
+	}
+	return tips
 }
 func GenerateGo(script types.CompiledScript) string {
 	required := map[string]bool{
@@ -703,6 +1012,9 @@ func GenerateGo(script types.CompiledScript) string {
 		"github.com/gorilla/websocket": false,
 		"encoding/json":                false,
 		"io":                           false,
+		"sync":                         false,
+		"bytes":                        false,
+		"runtime":                      false,
 	}
 
 	needsEvalMath := false
@@ -781,9 +1093,68 @@ func GenerateGo(script types.CompiledScript) string {
 				required["time"] = true
 				required["strconv"] = true
 				needsExpandVars = true
+			case types.OpSysWrite, types.OpSysReadFile, types.OpSysExit, types.OpSysYield:
+				required["syscall"] = true
+				required["unsafe"] = true
+				required["runtime"] = true
 			}
 			if len(ins.Body) > 0 {
 				analyze(ins.Body)
+			}
+		}
+	}
+
+	regMap := make(map[string]int)
+	getRegID := func(name string) int {
+		if id, ok := regMap[name]; ok {
+			return id
+		}
+		id := len(regMap)
+		regMap[name] = id
+		return id
+	}
+
+	var collectVars func([]types.Instruction)
+	collectVars = func(insts []types.Instruction) {
+		for _, ins := range insts {
+			if ins.Op == types.OpEmptyParallelLoop || ins.Op == types.OpMathLoop {
+				getRegID("BYPASS_TIME")
+			}
+			if ins.Value != "" && (ins.Op == types.OpSet || ins.Op == types.OpSetExpr || ins.Op == types.OpIncrement || ins.Op == types.OpTimerEnd || ins.Op == types.OpInput || ins.Op == types.OpFetch || ins.Op == types.OpPost || ins.Op == types.OpPut || ins.Op == types.OpPatch || ins.Op == types.OpDelete || ins.Op == types.OpJsonExtract || ins.Op == types.OpReadFile || ins.Op == types.OpSubstring || ins.Op == types.OpArrayGet || ins.Op == types.OpArrayLen || ins.Op == types.OpIndexOf) {
+				getRegID(ins.Value)
+			}
+			if strings.Contains(ins.Message, "%") {
+				parts := parseTemplate(ins.Message)
+				for i := 1; i < len(parts); i += 2 {
+					if parts[i] != "ITER" && parts[i] != "CORE" && parts[i] != "SRC_IP" && parts[i] != "DST_IP" && parts[i] != "PROTO" && parts[i] != "PROCESS" && parts[i] != "PID" {
+						getRegID(parts[i])
+					}
+				}
+			}
+			if strings.Contains(ins.Value, "%") {
+				parts := parseTemplate(ins.Value)
+				for i := 1; i < len(parts); i += 2 {
+					if parts[i] != "ITER" && parts[i] != "CORE" && parts[i] != "SRC_IP" && parts[i] != "DST_IP" && parts[i] != "PROTO" && parts[i] != "PROCESS" && parts[i] != "PID" {
+						getRegID(parts[i])
+					}
+				}
+			}
+			if ins.Condition != nil {
+				var walk func(*types.LogicExpr)
+				walk = func(e *types.LogicExpr) {
+					if e == nil {
+						return
+					}
+					if e.Op == types.LogVar {
+						getRegID(e.Value)
+					}
+					walk(e.Left)
+					walk(e.Right)
+				}
+				walk(ins.Condition)
+			}
+			if len(ins.Body) > 0 {
+				collectVars(ins.Body)
 			}
 		}
 	}
@@ -792,15 +1163,13 @@ func GenerateGo(script types.CompiledScript) string {
 	for _, fn := range script.Functions {
 		analyze(fn)
 	}
+	collectVars(script.Main)
+	for _, fn := range script.Functions {
+		collectVars(fn)
+	}
 
 	var sb strings.Builder
 	sb.WriteString("package main\n\nimport (\n")
-	if required["sync"] {
-		fmt.Fprintf(&sb, "\t\"sync\"\n")
-	}
-	if required["bytes"] {
-		fmt.Fprintf(&sb, "\t\"bytes\"\n")
-	}
 	for pkg, req := range required {
 		if req {
 			fmt.Fprintf(&sb, "\t\"%s\"\n", pkg)
@@ -809,14 +1178,20 @@ func GenerateGo(script types.CompiledScript) string {
 	sb.WriteString(")\n\n")
 
 	sb.WriteString("var discordLimitChannel string\n")
+	sb.WriteString("var regMap = map[string]int{\n")
+	for k, v := range regMap {
+		fmt.Fprintf(&sb, "\t%q: %d,\n", k, v)
+	}
+	sb.WriteString("}\n\n")
+
 	if required["sync"] && required["bytes"] {
 		sb.WriteString("var bufferPool = sync.Pool{\n")
-		sb.WriteString("\tNew: func() any { return new(bytes.Buffer) },\n}\n\n")
+		sb.WriteString("\tNew: func() any { return bytes.NewBuffer(make([]byte, 5*1024*1024)) },\n}\n\n")
 	}
 
 	sb.WriteString("func main() {\n")
-	sb.WriteString("\tout := bufio.NewWriter(os.Stdout)\n")
-	sb.WriteString("\tExecute(&types.PacketData{}, make(map[string]string), make(map[string][]string), make(map[string]time.Time), make(map[string]string), out)\n")
+	sb.WriteString("\tout := bufio.NewWriterSize(os.Stdout, 5*1024*1024)\n")
+	sb.WriteString("\tExecute(&types.PacketData{}, nil, make(map[string][]string), make(map[string]time.Time), make(map[string]string), out)\n")
 	sb.WriteString("\tout.Flush()\n")
 	if required["github.com/gorilla/websocket"] || required["net/http"] {
 		sb.WriteString("\tselect{}\n")
@@ -824,21 +1199,22 @@ func GenerateGo(script types.CompiledScript) string {
 	sb.WriteString("}\n\n")
 
 	for name, body := range script.Functions {
-		fmt.Fprintf(&sb, "func %s(pkt *types.PacketData, vars map[string]string, arrays map[string][]string, timers map[string]time.Time, headers map[string]string, out *bufio.Writer) bool {\n", name)
+		fmt.Fprintf(&sb, "func %s(pkt *types.PacketData, vars []string, arrays map[string][]string, timers map[string]time.Time, headers map[string]string, out *bufio.Writer) bool {\n", name)
 		for _, ins := range body {
-			sb.WriteString(translateToGo(ins, 1, false))
+			sb.WriteString(translateToGo(ins, 1, false, regMap))
 		}
 		sb.WriteString("\treturn false\n}\n\n")
 	}
 
-	sb.WriteString("func Execute(pkt *types.PacketData, vars map[string]string, arrays map[string][]string, timers map[string]time.Time, headers map[string]string, out *bufio.Writer) bool {\n")
+	sb.WriteString("func Execute(pkt *types.PacketData, _unused map[string]string, arrays map[string][]string, timers map[string]time.Time, headers map[string]string, out *bufio.Writer) bool {\n")
+	fmt.Fprintf(&sb, "\tvars := make([]string, %d)\n", len(regMap)+128)
 	sb.WriteString("\t_ = pkt\n")
 	sb.WriteString("\t_ = vars\n")
 	sb.WriteString("\t_ = arrays\n")
 	sb.WriteString("\t_ = timers\n")
 	sb.WriteString("\t_ = headers\n")
 	for _, ins := range script.Main {
-		sb.WriteString(translateToGo(ins, 1, false))
+		sb.WriteString(translateToGo(ins, 1, false, regMap))
 	}
 	sb.WriteString("\treturn false\n}\n")
 
@@ -857,7 +1233,7 @@ func convertMinecraftColors(input string) string {
 	return replacer.Replace(input)
 }
 
-func expandVars(input string, vars map[string]string) string {
+func expandVars(input string, vars []string, pkt *types.PacketData) string {
 	if !strings.Contains(input, "%") { return convertMinecraftColors(input) }
 	var sb strings.Builder
 	curr := input
@@ -869,55 +1245,42 @@ func expandVars(input string, vars map[string]string) string {
 		end := strings.IndexByte(curr, '%')
 		if end == -1 { sb.WriteByte('%'); sb.WriteString(curr); break }
 		key := curr[:end]
-		val, ok := vars[key]
-		if !ok {
-		} else {
-			f, err := strconv.ParseFloat(val, 64)
-			if err == nil && f > 0 && f < 1 {
-				if strings.HasPrefix(curr[end+1:], "ms") {
-					if key == "BYPASS_TIME" {
-						sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
-						sb.WriteString(" nanoseconds")
-					} else if f < 0.000000001 {
-						sb.WriteString(strconv.FormatFloat(f*1000000000000, 'f', 4, 64))
-						sb.WriteString(" femtoseconds")
-					} else if f < 0.000001 {
-						sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64))
-						sb.WriteString(" picoseconds")
-					} else if f < 0.001 {
-						sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
-						sb.WriteString(" nanoseconds")
-					} else {
-						sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64))
-						sb.WriteString(" microseconds")
-					}
-					curr = curr[end+3:]
-					continue
-				} else if strings.HasPrefix(curr[end+1:], "s") {
-					next := curr[end+1:]
-					if len(next) == 1 || next[1] == ' ' || next[1] == '\n' || next[1] == '\t' || next[1] == '.' || next[1] == ',' {
-						if f < 0.000000000001 {
-							sb.WriteString(strconv.FormatFloat(f*1000000000000000, 'f', 4, 64))
-							sb.WriteString(" femtoseconds")
-						} else if f < 0.000000001 {
-							sb.WriteString(strconv.FormatFloat(f*1000000000000, 'f', 4, 64))
-							sb.WriteString(" picoseconds")
-						} else if f < 0.000001 {
-							sb.WriteString(strconv.FormatFloat(f*1000000000, 'f', 4, 64))
+
+		handled := false
+		if pkt != nil {
+			switch key {
+			case "ITER": sb.WriteString(strconv.Itoa(pkt.Iteration)); handled = true
+			case "CORE": sb.WriteString(strconv.Itoa(pkt.Core)); handled = true
+			case "SRC_IP": sb.WriteString(pkt.SrcIP); handled = true
+			case "DST_IP": sb.WriteString(pkt.DstIP); handled = true
+			case "PROTO": sb.WriteString(pkt.Protocol); handled = true
+			case "PROCESS": sb.WriteString(pkt.ProcessName); handled = true
+			case "PID": sb.WriteString(strconv.Itoa(int(pkt.PID))); handled = true
+			}
+		}
+
+		if !handled {
+			if id, ok := regMap[key]; ok {
+				val := vars[id]
+				f, err := strconv.ParseFloat(val, 64)
+				if err == nil && f > 0 && f < 1 {
+					if strings.HasPrefix(curr[end+1:], "ms") {
+						if key == "BYPASS_TIME" {
+							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
 							sb.WriteString(" nanoseconds")
 						} else if f < 0.001 {
 							sb.WriteString(strconv.FormatFloat(f*1000000, 'f', 4, 64))
-							sb.WriteString(" microseconds")
+							sb.WriteString(" nanoseconds")
 						} else {
 							sb.WriteString(strconv.FormatFloat(f*1000, 'f', 4, 64))
-							sb.WriteString(" ms")
+							sb.WriteString(" microseconds")
 						}
-						curr = curr[end+2:]
+						curr = curr[end+3:]
 						continue
 					}
 				}
+				sb.WriteString(val)
 			}
-			sb.WriteString(val)
 		}
 		curr = curr[end+1:]
 	}
@@ -929,38 +1292,55 @@ func expandVars(input string, vars map[string]string) string {
 	if needsEvalMath {
 		sb.WriteString(`
 func evalMath(expr string) string {
-	tokens := make([]string, 0, 8); start := -1
-	for i := 0; i < len(expr); i++ {
-		c := expr[i]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
-			if start != -1 { tokens = append(tokens, expr[start:i]); start = -1 }; continue
+	var tokenize func(string) []string
+	tokenize = func(s string) []string {
+		var t []string; start := -1
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				if start != -1 { t = append(t, s[start:i]); start = -1 }; continue
+			}
+			if c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '(' || c == ')' {
+				if start != -1 { t = append(t, s[start:i]) }
+				t = append(t, string(c)); start = -1
+			} else if start == -1 { start = i }
 		}
-		if c == '+' || c == '-' || c == '*' || c == '/' {
-			if start != -1 { tokens = append(tokens, expr[start:i]) }
-			tokens = append(tokens, string(c)); start = -1
-		} else if start == -1 { start = i }
+		if start != -1 { t = append(t, s[start:]) }; return t
 	}
-	if start != -1 { tokens = append(tokens, expr[start:]) }
-	if len(tokens) < 3 { return expr }
-	highPrec := make([]string, 0, len(tokens))
-	for i := 0; i < len(tokens); i++ {
-		t := tokens[i]
-		if (t == "*" || t == "/") && len(highPrec) > 0 {
-			left, _ := strconv.ParseFloat(highPrec[len(highPrec)-1], 64)
-			i++; if i >= len(tokens) { break }
-			right, _ := strconv.ParseFloat(tokens[i], 64)
-			var res float64
-			if t == "*" { res = left * right } else if right != 0 { res = left / right }
-			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 18, 64)
-		} else { highPrec = append(highPrec, t) }
+	var solve func([]string) string
+	solve = func(tokens []string) string {
+		if len(tokens) == 0 { return "0" }
+		hp := make([]string, 0, len(tokens))
+		for i := 0; i < len(tokens); i++ {
+			t := tokens[i]
+			if (t == "*" || t == "/" || t == "%") && len(hp) > 0 {
+				l, _ := strconv.ParseFloat(hp[len(hp)-1], 64); i++
+				if i >= len(tokens) { break }; r, _ := strconv.ParseFloat(tokens[i], 64)
+				var res float64
+				if t == "*" { res = l * r } else if r != 0 {
+					if t == "/" { res = l / r } else { res = float64(int64(l) % int64(r)) }
+				}
+				hp[len(hp)-1] = strconv.FormatFloat(res, 'f', 18, 64)
+			} else { hp = append(hp, t) }
+		}
+		tot, _ := strconv.ParseFloat(hp[0], 64)
+		for i := 1; i < len(hp); i += 2 {
+			if i+1 >= len(hp) { break }; op := hp[i]; v, _ := strconv.ParseFloat(hp[i+1], 64)
+			if op == "+" { tot += v } else { tot -= v }
+		}
+		return strconv.FormatFloat(tot, 'f', 18, 64)
 	}
-	total, _ := strconv.ParseFloat(highPrec[0], 64)
-	for i := 1; i < len(highPrec); i += 2 {
-		if i+1 >= len(highPrec) { break }
-		op := highPrec[i]; val, _ := strconv.ParseFloat(highPrec[i+1], 64)
-		if op == "+" { total += val } else { total -= val }
+	tokens := tokenize(expr)
+	for {
+		o, c := -1, -1
+		for i, t := range tokens { if t == "(" { o = i } else if t == ")" { c = i; break } }
+		if o != -1 && c != -1 {
+			sub := solve(tokens[o+1 : c]); nt := append(tokens[:o], sub)
+			tokens = append(nt, tokens[c+1:]...); continue
+		}
+		break
 	}
-	return strconv.FormatFloat(total, 'f', 18, 64)
+	return solve(tokens)
 }
 `)
 	}
@@ -968,25 +1348,25 @@ func evalMath(expr string) string {
 	return sb.String()
 }
 
-func generateGoLogic(expr *types.LogicExpr) string {
+func generateGoLogic(expr *types.LogicExpr, regMap map[string]int) string {
 	if expr == nil {
 		return "false"
 	}
 	switch expr.Op {
 	case types.LogOr:
-		return "(" + generateGoLogic(expr.Left) + " || " + generateGoLogic(expr.Right) + ")"
+		return "(" + generateGoLogic(expr.Left, regMap) + " || " + generateGoLogic(expr.Right, regMap) + ")"
 	case types.LogAnd:
-		return "(" + generateGoLogic(expr.Left) + " && " + generateGoLogic(expr.Right) + ")"
+		return "(" + generateGoLogic(expr.Left, regMap) + " && " + generateGoLogic(expr.Right, regMap) + ")"
 	case types.LogEq:
-		return fmt.Sprintf("(%s == %s)", generateGoLogic(expr.Left), generateGoLogic(expr.Right))
+		return fmt.Sprintf("(%s == %s)", generateGoLogic(expr.Left, regMap), generateGoLogic(expr.Right, regMap))
 	case types.LogNe:
-		return fmt.Sprintf("(%s != %s)", generateGoLogic(expr.Left), generateGoLogic(expr.Right))
+		return fmt.Sprintf("(%s != %s)", generateGoLogic(expr.Left, regMap), generateGoLogic(expr.Right, regMap))
 	case types.LogGt:
-		return fmt.Sprintf("(%s > %s)", generateGoLogic(expr.Left), generateGoLogic(expr.Right))
+		return fmt.Sprintf("(%s > %s)", generateGoLogic(expr.Left, regMap), generateGoLogic(expr.Right, regMap))
 	case types.LogLt:
-		return fmt.Sprintf("(%s < %s)", generateGoLogic(expr.Left), generateGoLogic(expr.Right))
+		return fmt.Sprintf("(%s < %s)", generateGoLogic(expr.Left, regMap), generateGoLogic(expr.Right, regMap))
 	case types.LogVar:
-		return fmt.Sprintf("vars[%q]", expr.Value)
+		return fmt.Sprintf("vars[%d]", regMap[expr.Value])
 	case types.LogConst:
 		return fmt.Sprintf("%q", expr.Value)
 	default:
@@ -994,7 +1374,7 @@ func generateGoLogic(expr *types.LogicExpr) string {
 	}
 }
 
-func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
+func translateToGo(ins types.Instruction, depth int, inLoop bool, regMap map[string]int) string {
 	indent := strings.Repeat("\t", depth)
 
 	generateInlinedExpand := func(input string, targetWriter string) string {
@@ -1013,7 +1393,7 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 				case "CORE":
 					fmt.Fprintf(&expansion, "%s{ var b [20]byte; %s.Write(strconv.AppendInt(b[:0], int64(pkt.Core), 10)) }\n", indent, targetWriter)
 				default:
-					fmt.Fprintf(&expansion, "%sif v, ok := vars[%q]; ok { %s.WriteString(convertMinecraftColors(v)) }\n", indent, p, targetWriter)
+					fmt.Fprintf(&expansion, "%sif v := vars[%d]; v != \"\" { %s.WriteString(convertMinecraftColors(v)) }\n", indent, regMap[p], targetWriter)
 				}
 			}
 		}
@@ -1025,7 +1405,7 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		if ins.IsStatic {
 			res += fmt.Sprintf("%s\tfor i := 0; i < %d; i++ {\n", indent, ins.IntValue)
 		} else {
-			res += fmt.Sprintf("%s\tcount, _ := strconv.Atoi(vars[\"%s\"])\n", indent, ins.Value)
+			res += fmt.Sprintf("%s\tcount, _ := strconv.Atoi(vars[%d])\n", indent, regMap[ins.Value])
 			res += fmt.Sprintf("%s\tfor i := 0; i < count; i++ {\n", indent)
 		}
 
@@ -1035,7 +1415,7 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			res += fmt.Sprintf("%s\t\tout.WriteByte('\\n')\n", indent)
 		} else {
 			for _, bIns := range ins.Body {
-				res += translateToGo(bIns, depth+2, true)
+				res += translateToGo(bIns, depth+2, true, regMap)
 			}
 		}
 		res += fmt.Sprintf("%s\t}\n", indent)
@@ -1043,12 +1423,12 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		return res
 	case types.OpFetch:
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\treq, _ := http.NewRequest(\"GET\", expandVars(%q, vars), nil)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\treq, _ := http.NewRequest(\"GET\", expandVars(%q, vars, pkt), nil)\n", indent, ins.Value)
 		res += fmt.Sprintf("%s\tif req != nil {\n", indent)
 		res += fmt.Sprintf("%s\t\tfor k, v := range headers { req.Header.Set(k, v) }\n", indent)
 		res += fmt.Sprintf("%s\t\tresp, err := (&http.Client{}).Do(req)\n", indent)
 		res += fmt.Sprintf("%s\tif err == nil {\n", indent)
-		res += fmt.Sprintf("%s\t\t\tdefer resp.Body.Close(); b, _ := io.ReadAll(resp.Body); vars[%q] = string(b)\n", indent, ins.Message)
+		res += fmt.Sprintf("%s\t\t\tdefer resp.Body.Close(); b, _ := io.ReadAll(resp.Body); vars[%d] = string(b)\n", indent, regMap[ins.Message])
 		res += fmt.Sprintf("%s\t\t}\n", indent)
 		res += fmt.Sprintf("%s\t}\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
@@ -1056,13 +1436,13 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 	case types.OpPost:
 		parts := strings.SplitN(ins.Message, "|", 2)
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\tpayload := expandVars(%q, vars)\n", indent, parts[1])
-		res += fmt.Sprintf("%s\treq, _ := http.NewRequest(\"POST\", expandVars(%q, vars), strings.NewReader(payload))\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tpayload := expandVars(%q, vars, pkt)\n", indent, parts[1])
+		res += fmt.Sprintf("%s\treq, _ := http.NewRequest(\"POST\", expandVars(%q, vars, pkt), strings.NewReader(payload))\n", indent, ins.Value)
 		res += fmt.Sprintf("%s\tif req != nil {\n", indent)
 		res += fmt.Sprintf("%s\t\tfor k, v := range headers { req.Header.Set(k, v) }\n", indent)
 		res += fmt.Sprintf("%s\t\tresp, err := (&http.Client{}).Do(req)\n", indent)
 		res += fmt.Sprintf("%s\tif err == nil {\n", indent)
-		res += fmt.Sprintf("%s\t\t\tdefer resp.Body.Close(); b, _ := io.ReadAll(resp.Body); vars[%q] = string(b)\n", indent, parts[0])
+		res += fmt.Sprintf("%s\t\t\tdefer resp.Body.Close(); b, _ := io.ReadAll(resp.Body); vars[%d] = string(b)\n", indent, regMap[parts[0]])
 		res += fmt.Sprintf("%s\t\t}\n", indent)
 		res += fmt.Sprintf("%s\t}\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
@@ -1083,12 +1463,12 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			target = mParts[0]
 			payload = mParts[1]
 		}
-		res += fmt.Sprintf("%s\treq, _ := http.NewRequest(%q, expandVars(%q, vars), strings.NewReader(expandVars(%q, vars)))\n", indent, method, ins.Value, payload)
+		res += fmt.Sprintf("%s\treq, _ := http.NewRequest(%q, expandVars(%q, vars, pkt), strings.NewReader(expandVars(%q, vars, pkt)))\n", indent, method, ins.Value, payload)
 		res += fmt.Sprintf("%s\tif req != nil {\n", indent)
 		res += fmt.Sprintf("%s\t\tfor k, v := range headers { req.Header.Set(k, v) }\n", indent)
 		res += fmt.Sprintf("%s\t\tresp, err := (&http.Client{}).Do(req)\n", indent)
 		res += fmt.Sprintf("%s\tif err == nil {\n", indent)
-		res += fmt.Sprintf("%s\t\t\tdefer resp.Body.Close(); b, _ := io.ReadAll(resp.Body); vars[%q] = string(b)\n", indent, target)
+		res += fmt.Sprintf("%s\t\t\tdefer resp.Body.Close(); b, _ := io.ReadAll(resp.Body); vars[%d] = string(b)\n", indent, regMap[target])
 		res += fmt.Sprintf("%s\t\t}\n", indent)
 		res += fmt.Sprintf("%s\t}\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
@@ -1097,18 +1477,18 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		parts := strings.SplitN(ins.Message, "|", 2)
 		res := fmt.Sprintf("%s{\n", indent)
 		res += fmt.Sprintf("%s\tvar data any\n", indent)
-		res += fmt.Sprintf("%s\tkey := strings.Trim(expandVars(%q, vars), \"\\\"\")\n", indent, parts[0])
-		res += fmt.Sprintf("%s\tif err := json.Unmarshal([]byte(expandVars(%q, vars)), &data); err == nil {\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tkey := strings.Trim(expandVars(%q, vars, pkt), \"\\\"\")\n", indent, parts[0])
+		res += fmt.Sprintf("%s\tif err := json.Unmarshal([]byte(expandVars(%q, vars, pkt)), &data); err == nil {\n", indent, ins.Value)
 		res += fmt.Sprintf("%s\t\tif arr, ok := data.([]any); ok && len(arr) > 0 { data = arr[0] }\n", indent)
 		res += fmt.Sprintf("%s\t\tif m, ok := data.(map[string]any); ok {\n", indent)
-		res += fmt.Sprintf("%s\t\t\tif v, exists := m[key]; exists { vars[%q] = fmt.Sprint(v) }\n", indent, parts[1])
+		res += fmt.Sprintf("%s\t\t\tif v, exists := m[key]; exists { vars[%d] = fmt.Sprint(v) }\n", indent, regMap[parts[1]])
 		res += fmt.Sprintf("%s\t\t}\n", indent)
 		res += fmt.Sprintf("%s\t}\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 	case types.OpDiscordConnect:
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\ttoken := expandVars(%q, vars)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\ttoken := expandVars(%q, vars, pkt)\n", indent, ins.Value)
 		res += fmt.Sprintf("%s\ttype gatewayEvent struct { Op int `json:\"op\"`; T string `json:\"t\"`; D json.RawMessage `json:\"d\"` }\n", indent)
 		res += fmt.Sprintf("%s\t\tgo func() {\n", indent)
 		res += fmt.Sprintf("%s\t\t\tdialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}\n", indent)
@@ -1132,12 +1512,12 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		res += fmt.Sprintf("%s\t\t\t\t\tcID, _ := d[\"channel_id\"].(string)\n", indent)
 		res += fmt.Sprintf("%s\t\t\t\t\tif discordLimitChannel != \"\" && cID != discordLimitChannel { continue }\n", indent)
 		res += fmt.Sprintf("%s\t\t\t\t\tauthor, _ := d[\"author\"].(map[string]any)\n", indent)
-		res += fmt.Sprintf("%s\t\t\t\t\tvars[\"msg_author_bot\"] = \"false\"\n", indent)
-		res += fmt.Sprintf("%s\t\t\t\t\tif b, ok := author[\"bot\"].(bool); ok && b { vars[\"msg_author_bot\"] = \"true\" }\n", indent)
-		res += fmt.Sprintf("%s\t\t\t\t\tvars[\"msg_content\"], _ = d[\"content\"].(string)\n", indent)
-		res += fmt.Sprintf("%s\t\t\t\t\tvars[\"channel_id\"] = cID\n", indent)
-		res += fmt.Sprintf("%s\t\t\t\t\tvars[\"guild_id\"], _ = d[\"guild_id\"].(string)\n", indent)
-		res += fmt.Sprintf("%s\t\t\t\t\tvars[\"msg_id\"], _ = d[\"id\"].(string)\n", indent)
+		res += fmt.Sprintf("%s\t\t\t\t\tvars[%d] = \"false\"\n", indent, regMap["msg_author_bot"])
+		res += fmt.Sprintf("%s\t\t\t\t\tif b, ok := author[\"bot\"].(bool); ok && b { vars[%d] = \"true\" }\n", indent, regMap["msg_author_bot"])
+		res += fmt.Sprintf("%s\t\t\t\t\tvars[%d], _ = d[\"content\"].(string)\n", indent, regMap["msg_content"])
+		res += fmt.Sprintf("%s\t\t\t\t\tvars[%d] = cID\n", indent, regMap["channel_id"])
+		res += fmt.Sprintf("%s\t\t\t\t\tvars[%d], _ = d[\"guild_id\"].(string)\n", indent, regMap["guild_id"])
+		res += fmt.Sprintf("%s\t\t\t\t\tvars[%d], _ = d[\"id\"].(string)\n", indent, regMap["msg_id"])
 		res += fmt.Sprintf("%s\t\t\t\t\tON_MESSAGE(pkt, vars, arrays, timers, headers, out)\n", indent)
 		res += fmt.Sprintf("%s\t\t\t\t}\n", indent)
 		res += fmt.Sprintf("%s\t\t\t\t}\n", indent)
@@ -1147,52 +1527,52 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 	case types.OpDiscordLimit:
-		return fmt.Sprintf("%sdiscordLimitChannel = expandVars(%q, vars)\n", indent, ins.Value)
+		return fmt.Sprintf("%sdiscordLimitChannel = expandVars(%q, vars, pkt)\n", indent, ins.Value)
 	case types.OpSubstring:
 		parts := strings.SplitN(ins.Message, "|", 3)
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\tsrc := expandVars(%q, vars)\n", indent, ins.Value)
-		res += fmt.Sprintf("%s\tstart, _ := strconv.Atoi(expandVars(%q, vars))\n", indent, parts[0])
-		res += fmt.Sprintf("%s\tlength, _ := strconv.Atoi(expandVars(%q, vars))\n", indent, parts[1])
+		res += fmt.Sprintf("%s\tsrc := expandVars(%q, vars, pkt)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tstart, _ := strconv.Atoi(expandVars(%q, vars, pkt))\n", indent, parts[0])
+		res += fmt.Sprintf("%s\tlength, _ := strconv.Atoi(expandVars(%q, vars, pkt))\n", indent, parts[1])
 		res += fmt.Sprintf("%s\tif start >= 0 && start < len(src) {\n", indent)
 		res += fmt.Sprintf("%s\t\tend := start + length\n", indent)
 		res += fmt.Sprintf("%s\t\tif end > len(src) { end = len(src) }\n", indent)
-		res += fmt.Sprintf("%s\t\tvars[%q] = src[start:end]\n", indent, parts[2])
+		res += fmt.Sprintf("%s\t\tvars[%d] = src[start:end]\n", indent, regMap[parts[2]])
 		res += fmt.Sprintf("%s\t}\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 	case types.OpSetHeader:
-		return fmt.Sprintf("%sheaders[%q] = expandVars(%q, vars)\n", indent, ins.Value, ins.Message)
+		return fmt.Sprintf("%sheaders[%q] = expandVars(%q, vars, pkt)\n", indent, ins.Value, ins.Message)
 
 	case types.OpSleep:
-		res := fmt.Sprintf("%sif ms, err := strconv.Atoi(expandVars(%q, vars)); err == nil {\n", indent, ins.Value)
+		res := fmt.Sprintf("%sif ms, err := strconv.Atoi(expandVars(%q, vars, pkt)); err == nil {\n", indent, ins.Value)
 		res += fmt.Sprintf("%s\ttime.Sleep(time.Duration(ms) * time.Millisecond)\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 
 	case types.OpIfComplex:
-		res := fmt.Sprintf("%sif %s {\n", indent, generateGoLogic(ins.Condition))
+		res := fmt.Sprintf("%sif %s {\n", indent, generateGoLogic(ins.Condition, regMap))
 		for _, bIns := range ins.Body {
-			res += translateToGo(bIns, depth+1, inLoop)
+			res += translateToGo(bIns, depth+1, inLoop, regMap)
 		}
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 
 	case types.OpWhile:
-		res := fmt.Sprintf("%sfor %s {\n", indent, generateGoLogic(ins.Condition))
+		res := fmt.Sprintf("%sfor %s {\n", indent, generateGoLogic(ins.Condition, regMap))
 		for _, bIns := range ins.Body {
-			res += translateToGo(bIns, depth+1, true)
+			res += translateToGo(bIns, depth+1, true, regMap)
 		}
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 
 	case types.OpInput:
 		res := fmt.Sprintf("%sout.Flush()\n", indent)
-		res += fmt.Sprintf("%sfmt.Print(expandVars(%q, vars))\n", indent, ins.Message)
+		res += fmt.Sprintf("%sfmt.Print(expandVars(%q, vars, pkt))\n", indent, ins.Message)
 		res += fmt.Sprintf("%s{\n", indent)
 		res += fmt.Sprintf("%s\treader := bufio.NewReader(os.Stdin)\n", indent)
 		res += fmt.Sprintf("%s\ttext, _ := reader.ReadString('\\n')\n", indent)
-		res += fmt.Sprintf("%s\tvars[%q] = strings.TrimSpace(text)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tvars[%d] = strings.TrimSpace(text)\n", indent, regMap[ins.Value])
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 
@@ -1207,15 +1587,15 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		if key == "" {
 			key = "DEFAULT"
 		}
-		return fmt.Sprintf("%svars[%q] = strconv.FormatFloat(time.Since(timers[%q]).Seconds(), 'f', 9, 64)\n", indent, ins.Value, key)
+		return fmt.Sprintf("%svars[%d] = strconv.FormatFloat(time.Since(timers[%q]).Seconds(), 'f', 9, 64)\n", indent, regMap[ins.Value], key)
 	case types.OpTime:
-		return fmt.Sprintf("%svars[\"%s\"] = strconv.FormatFloat(float64(time.Now().UnixNano())/1e6, 'f', 9, 64)\n", indent, ins.Value)
+		return fmt.Sprintf("%svars[%d] = strconv.FormatFloat(float64(time.Now().UnixNano())/1e6, 'f', 9, 64)\n", indent, regMap[ins.Value])
 	case types.OpExec:
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\tcmd := exec.Command(\"sh\", \"-c\", expandVars(%q, vars))\n", indent, ins.Message)
+		res += fmt.Sprintf("%s\tcmd := exec.Command(\"sh\", \"-c\", expandVars(%q, vars, pkt))\n", indent, ins.Message)
 		if ins.Value != "" {
 			res += fmt.Sprintf("%s\tout, _ := cmd.CombinedOutput()\n", indent)
-			res += fmt.Sprintf("%s\tvars[%q] = strings.TrimSpace(string(out))\n", indent, ins.Value)
+			res += fmt.Sprintf("%s\tvars[%d] = strings.TrimSpace(string(out))\n", indent, regMap[ins.Value])
 		} else {
 			res += fmt.Sprintf("%s\tgo cmd.Run()\n", indent)
 		}
@@ -1223,25 +1603,25 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		return res
 	case types.OpSet:
 		if !strings.Contains(ins.Message, "%") {
-			return fmt.Sprintf("%svars[%q] = %q\n", indent, ins.Value, convertMinecraftColors(ins.Message))
+			return fmt.Sprintf("%svars[%d] = %q\n", indent, regMap[ins.Value], convertMinecraftColors(ins.Message))
 		}
-		return fmt.Sprintf("%svars[\"%s\"] = expandVars(%q, vars)\n", indent, ins.Value, ins.Message)
+		return fmt.Sprintf("%svars[%d] = expandVars(%q, vars, pkt)\n", indent, regMap[ins.Value], ins.Message)
 	case types.OpSetExpr:
-		return fmt.Sprintf("%svars[\"%s\"] = evalMath(expandVars(%q, vars))\n", indent, ins.Value, ins.Message)
+		return fmt.Sprintf("%svars[%d] = evalMath(expandVars(%q, vars, pkt))\n", indent, regMap[ins.Value], ins.Message)
 	case types.OpIncrement:
-		return fmt.Sprintf("%s{\n%s\tv, _ := strconv.Atoi(vars[\"%s\"])\n%s\tvars[\"%s\"] = strconv.Itoa(v + 1)\n%s}\n", indent, indent, ins.Value, indent, ins.Value, indent)
+		return fmt.Sprintf("%s{\n%s\tv, _ := strconv.Atoi(vars[%d])\n%s\tvars[%d] = strconv.Itoa(v + 1)\n%s}\n", indent, indent, regMap[ins.Value], indent, regMap[ins.Value], indent)
 	case types.OpIfCall:
 		stopCmd := "return true"
 		if inLoop {
 			stopCmd = "break"
 		}
-		return fmt.Sprintf("%sif %s { if %s(pkt, vars, arrays, timers, headers, out) { %s } }\n", indent, generateGoLogic(ins.Condition), ins.Message, stopCmd)
+		return fmt.Sprintf("%sif %s { if %s(pkt, vars, arrays, timers, headers, out) { %s } }\n", indent, generateGoLogic(ins.Condition, regMap), ins.Message, stopCmd)
 	case types.OpIfBreak:
 		stopCmd := "return true"
 		if inLoop {
 			stopCmd = "break"
 		}
-		return fmt.Sprintf("%sif %s { %s }\n", indent, generateGoLogic(ins.Condition), stopCmd)
+		return fmt.Sprintf("%sif %s { %s }\n", indent, generateGoLogic(ins.Condition, regMap), stopCmd)
 	case types.OpBreak:
 		stopCmd := "return true"
 		if inLoop {
@@ -1255,27 +1635,28 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		}
 		return fmt.Sprintf("%sif %s(pkt, vars, arrays, timers, headers, out) { %s }\n", indent, ins.Value, stopCmd)
 	case types.OpReadFile:
-		return fmt.Sprintf("%s{ data, _ := os.ReadFile(expandVars(%q, vars)); vars[%q] = string(data) }\n", indent, ins.Value, ins.Message)
+		return fmt.Sprintf("%s{ data, _ := os.ReadFile(expandVars(%q, vars, pkt)); vars[%d] = string(data) }\n", indent, ins.Value, regMap[ins.Message])
 	case types.OpTokenize:
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\tsrc := expandVars(%q, vars)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tsrc := expandVars(%q, vars, pkt)\n", indent, ins.Value)
 		res += fmt.Sprintf("%s\tmParts := strings.SplitN(%q, \"|\", 2)\n", indent, ins.Message)
 		res += fmt.Sprintf("%s\tvar tokens []string\n", indent)
-		res += fmt.Sprintf("%s\tswitch expandVars(mParts[0], vars) { case \"SPACE\": tokens = strings.Fields(src); case \"NEWLINE\": tokens = strings.Split(src, \"\\n\"); default: tokens = strings.Split(src, expandVars(mParts[0], vars)) }\n", indent)
+		res += fmt.Sprintf("%s\tswitch expandVars(mParts[0], vars, pkt) { case \"SPACE\": tokens = strings.Fields(src); case \"NEWLINE\": tokens = strings.Split(src, \"\\n\"); default: tokens = strings.Split(src, expandVars(mParts[0], vars, pkt)) }\n", indent)
 		res += fmt.Sprintf("%s\tarrays[mParts[1]] = tokens\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 	case types.OpArrayGet:
+		mParts := strings.SplitN(ins.Message, "|", 2)
 		res := fmt.Sprintf("%s{\n", indent)
 		res += fmt.Sprintf("%s\tmParts := strings.SplitN(%q, \"|\", 2)\n", indent, ins.Message)
-		res += fmt.Sprintf("%s\tidx, _ := strconv.Atoi(expandVars(mParts[0], vars))\n", indent)
-		res += fmt.Sprintf("%s\tif arr, ok := arrays[%q]; ok && idx >= 0 && idx < len(arr) { vars[mParts[1]] = arr[idx] }\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tidx, _ := strconv.Atoi(expandVars(mParts[0], vars, pkt))\n", indent)
+		res += fmt.Sprintf("%s\tif arr, ok := arrays[%q]; ok && idx >= 0 && idx < len(arr) { vars[%d] = arr[idx] }\n", indent, ins.Value, regMap[mParts[1]])
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 	case types.OpServe:
 		res := ""
 		if ins.Condition != nil {
-			res += fmt.Sprintf("%sif %s {\n", indent, generateGoLogic(ins.Condition))
+			res += fmt.Sprintf("%sif %s {\n", indent, generateGoLogic(ins.Condition, regMap))
 			indent += "\t"
 		}
 		portArg, dirArg := ins.Value, ins.Message
@@ -1284,14 +1665,14 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			portArg, dirArg = mParts[0], mParts[1]
 		}
 		res += fmt.Sprintf("%sgo func() {\n", indent)
-		res += fmt.Sprintf("%s\trawPort := expandVars(%q, vars)\n", indent, portArg)
+		res += fmt.Sprintf("%s\trawPort := expandVars(%q, vars, pkt)\n", indent, portArg)
 		res += fmt.Sprintf("%s\thost := \"127.0.0.1:\"\n", indent)
 		res += fmt.Sprintf("%s\tport := rawPort\n", indent)
 		res += fmt.Sprintf("%s\tif strings.HasSuffix(rawPort, \"|PUBLIC\") {\n", indent)
 		res += fmt.Sprintf("%s\t\thost = \":\"\n", indent)
 		res += fmt.Sprintf("%s\t\tport = strings.TrimSuffix(rawPort, \"|PUBLIC\")\n", indent)
 		res += fmt.Sprintf("%s\t}\n", indent)
-		res += fmt.Sprintf("%s\tdir := expandVars(%q, vars)\n", indent, dirArg)
+		res += fmt.Sprintf("%s\tdir := expandVars(%q, vars, pkt)\n", indent, dirArg)
 		res += fmt.Sprintf("%s\tif dir == \"\" { dir = \"./www\" }\n", indent)
 		res += fmt.Sprintf("%s\tmux := http.NewServeMux()\n", indent)
 		res += fmt.Sprintf("%s\tmux.Handle(\"/\", http.FileServer(http.Dir(dir)))\n", indent)
@@ -1309,18 +1690,18 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			if ins.Duration > 0 {
 				res += fmt.Sprintf("%s\ttime.Sleep(time.Duration(%d))\n", indent, int64(ins.Duration))
 			}
-			res += fmt.Sprintf("%s\tvars[\"BYPASS_TIME\"] = strconv.FormatFloat(float64(time.Since(start).Nanoseconds())/1e6, 'f', 9, 64)\n", indent)
+			res += fmt.Sprintf("%s\tvars[%d] = strconv.FormatFloat(float64(time.Since(start).Nanoseconds())/1e6, 'f', 9, 64)\n", indent, regMap["BYPASS_TIME"])
 			res += fmt.Sprintf("%s}\n", indent)
 			return res
 		}
 		res := fmt.Sprintf("%s{\n", indent)
-		res += fmt.Sprintf("%s\tsnapshot := make(map[string]string, len(vars))\n", indent)
-		res += fmt.Sprintf("%s\tfor k, v := range vars { snapshot[k] = v }\n", indent)
+		res += fmt.Sprintf("%s\tsnapshot := make([]string, len(vars))\n", indent)
+		res += fmt.Sprintf("%s\tcopy(snapshot, vars)\n", indent)
 		res += fmt.Sprintf("%s\tnumWorkers := runtime.GOMAXPROCS(0)\n", indent)
 		if ins.IsStatic {
 			res += fmt.Sprintf("%s\tcount := %d\n", indent, ins.IntValue)
 		} else {
-			res += fmt.Sprintf("%s\tcount, _ := strconv.Atoi(vars[\"%s\"])\n", indent, ins.Value)
+			res += fmt.Sprintf("%s\tcount, _ := strconv.Atoi(vars[%d])\n", indent, regMap[ins.Value])
 		}
 
 		res += fmt.Sprintf("%s\tvar wg sync.WaitGroup\n", indent)
@@ -1335,9 +1716,10 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			res += fmt.Sprintf("%s\t\tgo func(id int, lb *bytes.Buffer) {\n", indent)
 			res += fmt.Sprintf("%s\t\t\tdefer wg.Done()\n", indent)
 			res += fmt.Sprintf("%s\t\t\tlp := *pkt; lp.Core = id + 1\n", indent)
+			res += fmt.Sprintf("%s\t\t\tvars := make([]string, len(snapshot)); copy(vars, snapshot)\n", indent)
 			res += fmt.Sprintf("%s\t\t\tfor i := (count * id) / numWorkers; i < (count * (id + 1)) / numWorkers; i++ {\n", indent)
 			res += fmt.Sprintf("%s\t\t\t\tlp.Iteration = i\n", indent)
-			res += strings.ReplaceAll(generateInlinedExpand(ins.Body[0].Message, "lb"), "vars", "snapshot")
+			res += generateInlinedExpand(ins.Body[0].Message, "lb")
 			res += fmt.Sprintf("%s\t\t\t\tlb.WriteByte('\\n')\n", indent)
 			res += fmt.Sprintf("%s\t\t\t}\n", indent)
 			res += fmt.Sprintf("%s\t\t}(w, buffers[w])\n", indent)
@@ -1345,13 +1727,13 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			res += fmt.Sprintf("%s\t\tgo func(workerID int, localBuf *bytes.Buffer) {\n", indent)
 			res += fmt.Sprintf("%s\t\t\tdefer wg.Done()\n", indent)
 			res += fmt.Sprintf("%s\t\t\tlp := *pkt; lp.Core = workerID + 1\n", indent)
-			res += fmt.Sprintf("%s\t\t\tlocalOut := bufio.NewWriter(localBuf)\n", indent)
-			res += fmt.Sprintf("%s\t\t\tvars := snapshot\n", indent)
+			res += fmt.Sprintf("%s\t\t\tlocalOut := bufio.NewWriterSize(localBuf, 5*1024*1024)\n", indent)
+			res += fmt.Sprintf("%s\t\t\tvars := make([]string, len(snapshot)); copy(vars, snapshot)\n", indent)
 			res += fmt.Sprintf("%s\t\t\t_ = vars\n", indent)
 			res += fmt.Sprintf("%s\t\t\tfor i := (count * workerID) / numWorkers; i < (count * (workerID + 1)) / numWorkers; i++ {\n", indent)
 			res += fmt.Sprintf("%s\t\t\t\tlp.Iteration = i\n", indent)
 			for _, bIns := range ins.Body {
-				res += strings.ReplaceAll(translateToGo(bIns, depth+4, true), "out.", "localOut.")
+				res += strings.ReplaceAll(translateToGo(bIns, depth+4, true, regMap), "out.", "localOut.")
 			}
 			res += fmt.Sprintf("%s\t\t\t}\n", indent)
 			res += fmt.Sprintf("%s\t\t\tlocalOut.Flush()\n", indent)
@@ -1363,6 +1745,41 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 		res += fmt.Sprintf("%s\tfor _, b := range buffers { out.Write(b.Bytes()); bufferPool.Put(b) }\n", indent)
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
+	case types.OpMathLoop:
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\tstart := time.Now()\n", indent)
+		res += fmt.Sprintf("%s\titerations := %d\n", indent, ins.IntValue)
+		res += fmt.Sprintf("%s\tregID := %d\n", indent, regMap[ins.Value])
+		res += fmt.Sprintf("%s\tx, _ := strconv.ParseInt(vars[regID], 10, 64)\n", indent)
+
+		var a, b, m int64 = 1, 0, 1
+		parts := strings.Fields(strings.ReplaceAll(strings.ReplaceAll(ins.Message, "(", " "), ")", " "))
+		if len(parts) >= 7 {
+			a, _ = strconv.ParseInt(parts[2], 10, 64)
+			b, _ = strconv.ParseInt(parts[4], 10, 64)
+			m, _ = strconv.ParseInt(parts[6], 10, 64)
+		}
+
+		res += fmt.Sprintf("%s\tpowMod := func(a, b, m int64) int64 {\n", indent)
+		res += fmt.Sprintf("%s\t\tres := int64(1); a %%= m\n", indent)
+		res += fmt.Sprintf("%s\t\tfor b > 0 { if b%%2 == 1 { res = (res * a) %% m }; a = (a * a) %% m; b /= 2 }\n", indent)
+		res += fmt.Sprintf("%s\t\treturn res\n\t}\n", indent)
+
+		res += fmt.Sprintf("%s\tvar sumPowMod func(int64, int64, int64) int64\n", indent)
+		res += fmt.Sprintf("%s\tsumPowMod = func(a, k, m int64) int64 {\n", indent)
+		res += fmt.Sprintf("%s\t\tif k == 0 { return 0 }; if k == 1 { return 1 }\n", indent)
+		res += fmt.Sprintf("%s\t\tif k%%2 == 0 { return (sumPowMod(a, k/2, m) * (1 + powMod(a, k/2, m))) %% m }\n", indent)
+		res += fmt.Sprintf("%s\t\treturn (1 + a*sumPowMod(a, k-1, m)) %% m\n\t}\n", indent)
+
+		res += fmt.Sprintf("%s\tx = (powMod(%d, int64(iterations), %d)*x + %d*sumPowMod(%d, int64(iterations), %d)) %% %d\n", indent, a, m, b, a, m, m)
+		res += fmt.Sprintf("%s\tvars[regID] = strconv.FormatInt(x, 10)\n", indent)
+		res += fmt.Sprintf("%s\tdur := time.Since(start)\n", indent)
+		res += fmt.Sprintf("%s\tvars[regMap[\"BYPASS_TIME\"]] = strconv.FormatFloat(float64(dur.Nanoseconds())/1e6, 'f', 9, 64)\n", indent)
+		res += fmt.Sprintf("%s\tout.WriteString(\"[AOT MATH OPTIMIZER] \")\n", indent)
+		res += fmt.Sprintf("%s\tout.WriteString(strconv.Itoa(iterations) + \" iterations processed in \" + dur.String() + \"\\n\")\n", indent)
+		res += fmt.Sprintf("%s\tout.Flush()\n", indent)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
 
 	case types.OpPrint:
 		if ins.IsStatic {
@@ -1370,29 +1787,90 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool) string {
 			return fmt.Sprintf("%sout.WriteString(%q)\n", indent, msg)
 		}
 		return generateInlinedExpand(ins.Message, "out") + fmt.Sprintf("%s\tout.WriteByte('\\n')\n", indent)
+	case types.OpSysWrite:
+		res := fmt.Sprintf("%sif runtime.GOOS != \"linux\" && runtime.GOOS != \"windows\" {\n", indent)
+		res += fmt.Sprintf("%s\tmsg := expandVars(%q, vars, pkt)\n", indent, ins.Message)
+		res += fmt.Sprintf("%s\tsyscall.RawSyscall(4, 1, uintptr(unsafe.Pointer(unsafe.StringData(msg))), uintptr(len(msg)))\n", indent)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpSysReadFile:
+		res := fmt.Sprintf("%sif runtime.GOOS != \"linux\" && runtime.GOOS != \"windows\" {\n", indent)
+		res += fmt.Sprintf("%s\tname := expandVars(%q, vars, pkt)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tbuf := make([]byte, 4096)\n", indent)
+		res += fmt.Sprintf("%s\tret, _, _ := syscall.RawSyscall(3, uintptr(unsafe.Pointer(unsafe.StringData(name))), uintptr(unsafe.Pointer(&buf[0])), 0)\n", indent)
+		res += fmt.Sprintf("%s\tif int(ret) >= 0 { vars[%d] = string(buf[:ret]) }\n", indent, regMap[ins.Message])
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpSysExit:
+		res := fmt.Sprintf("%sif runtime.GOOS != \"linux\" && runtime.GOOS != \"windows\" {\n", indent)
+		res += fmt.Sprintf("%s\tcode, _ := strconv.Atoi(expandVars(%q, vars, pkt))\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tsyscall.RawSyscall(1, uintptr(code), 0, 0)\n", indent)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpSysYield:
+		res := fmt.Sprintf("%sif runtime.GOOS != \"linux\" && runtime.GOOS != \"windows\" {\n", indent)
+		res += fmt.Sprintf("%s\tsyscall.RawSyscall(24, 0, 0, 0)\n", indent)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
 	default:
 		return fmt.Sprintf("%s// Unsupported Op: %d\n", indent, ins.Op)
 	}
 }
 
+func mergePrints(insts []types.Instruction) ([]types.Instruction, []string) {
+	var tips []string
+	if len(insts) == 0 {
+		return insts, tips
+	}
+
+	res := make([]types.Instruction, 0, len(insts))
+	for i := 0; i < len(insts); i++ {
+		ins := insts[i]
+		if ins.Op == types.OpPrint {
+			j := i + 1
+			merged := 0
+			for j < len(insts) && insts[j].Op == types.OpPrint {
+				ins.Message += "\n" + insts[j].Message
+				j++
+				merged++
+			}
+			if merged > 0 {
+				tips = append(tips, fmt.Sprintf("Merged %d consecutive PRINT statements into a single buffer operation", merged+1))
+				ins.IsStatic = !strings.Contains(ins.Message, "%")
+				if !ins.IsStatic {
+					ins.TemplateParts = parseTemplate(ins.Message)
+				}
+				i = j - 1
+			}
+		}
+		if len(ins.Body) > 0 {
+			var subTips []string
+			ins.Body, subTips = mergePrints(ins.Body)
+			tips = append(tips, subTips...)
+		}
+		res = append(res, ins)
+	}
+	return res, tips
+}
+
 func parseTemplate(input string) []string {
 	pctCount := strings.Count(input, "%")
 	if pctCount == 0 {
-		return []string{input}
+		return []string{convertMinecraftColors(input)}
 	}
 	parts := make([]string, 0, (pctCount/2)*2+1)
 	curr := input
 	for {
 		idx := strings.IndexByte(curr, '%')
 		if idx == -1 {
-			parts = append(parts, curr)
+			parts = append(parts, convertMinecraftColors(curr))
 			break
 		}
-		parts = append(parts, curr[:idx])
+		parts = append(parts, convertMinecraftColors(curr[:idx]))
 		curr = curr[idx+1:]
 		end := strings.IndexByte(curr, '%')
 		if end == -1 {
-			parts = append(parts, "%"+curr)
+			parts = append(parts, convertMinecraftColors("%"+curr))
 			break
 		}
 		parts = append(parts, curr[:end])
@@ -1402,76 +1880,100 @@ func parseTemplate(input string) []string {
 }
 
 func evalMath(expr string) string {
-	tokens := make([]string, 0, 8)
-	start := -1
-	for i := 0; i < len(expr); i++ {
-		c := expr[i]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
-			if start != -1 {
-				tokens = append(tokens, expr[start:i])
+	tokenize := func(s string) []string {
+		var t []string
+		start := -1
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				if start != -1 {
+					t = append(t, s[start:i])
+					start = -1
+				}
+				continue
+			}
+			if c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '(' || c == ')' {
+				if start != -1 {
+					t = append(t, s[start:i])
+				}
+				t = append(t, string(c))
 				start = -1
+			} else if start == -1 {
+				start = i
 			}
-			continue
 		}
-		if c == '+' || c == '-' || c == '*' || c == '/' {
-			if start != -1 {
-				tokens = append(tokens, expr[start:i])
+		if start != -1 {
+			t = append(t, s[start:])
+		}
+		return t
+	}
+	solve := func(tokens []string) string {
+		if len(tokens) == 0 {
+			return "0"
+		}
+		hp := make([]string, 0, len(tokens))
+		for i := 0; i < len(tokens); i++ {
+			t := tokens[i]
+			if (t == "*" || t == "/" || t == "%") && len(hp) > 0 {
+				l, _ := strconv.ParseFloat(hp[len(hp)-1], 64)
+				i++
+				if i >= len(tokens) {
+					break
+				}
+				r, _ := strconv.ParseFloat(tokens[i], 64)
+				var res float64
+				if t == "*" {
+					res = l * r
+				} else if r != 0 {
+					if t == "/" {
+						res = l / r
+					} else {
+						res = float64(int64(l) % int64(r))
+					}
+				}
+				hp[len(hp)-1] = strconv.FormatFloat(res, 'f', 18, 64)
+			} else {
+				hp = append(hp, t)
 			}
-			tokens = append(tokens, string(c))
-			start = -1
-		} else if start == -1 {
-			start = i
 		}
-	}
-	if start != -1 {
-		tokens = append(tokens, expr[start:])
-	}
-
-	if len(tokens) < 3 {
-		return expr
-	}
-
-	var highPrec []string
-	for i := 0; i < len(tokens); i++ {
-		t := tokens[i]
-		if (t == "*" || t == "/") && len(highPrec) > 0 {
-			left, _ := strconv.ParseFloat(highPrec[len(highPrec)-1], 64)
-			i++
-			if i >= len(tokens) {
+		if len(hp) == 0 {
+			return "0"
+		}
+		tot, _ := strconv.ParseFloat(hp[0], 64)
+		for i := 1; i < len(hp); i += 2 {
+			if i+1 >= len(hp) {
 				break
 			}
-			right, _ := strconv.ParseFloat(tokens[i], 64)
-			var res float64
-			if t == "*" {
-				res = left * right
-			} else if right != 0 {
-				res = left / right
+			op := hp[i]
+			v, _ := strconv.ParseFloat(hp[i+1], 64)
+			if op == "+" {
+				tot += v
+			} else {
+				tot -= v
 			}
-			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 18, 64)
-		} else {
-			highPrec = append(highPrec, t)
 		}
+		return strconv.FormatFloat(tot, 'f', 18, 64)
 	}
-
-	if len(highPrec) == 0 {
-		return "0"
-	}
-	total, _ := strconv.ParseFloat(highPrec[0], 64)
-	for i := 1; i < len(highPrec); i += 2 {
-		if i+1 >= len(highPrec) {
-			break
+	tokens := tokenize(expr)
+	for {
+		o, c := -1, -1
+		for i, t := range tokens {
+			if t == "(" {
+				o = i
+			} else if t == ")" {
+				c = i
+				break
+			}
 		}
-		op := highPrec[i]
-		val, _ := strconv.ParseFloat(highPrec[i+1], 64)
-		switch op {
-		case "+":
-			total += val
-		case "-":
-			total -= val
+		if o != -1 && c != -1 {
+			sub := solve(tokens[o+1 : c])
+			nt := append(tokens[:o], sub)
+			tokens = append(nt, tokens[c+1:]...)
+			continue
 		}
+		break
 	}
-
-	return strconv.FormatFloat(total, 'f', 18, 64)
+	return solve(tokens)
 }
 
 func convertMinecraftColors(input string) string {

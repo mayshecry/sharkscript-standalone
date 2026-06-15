@@ -73,6 +73,11 @@ const (
 	OpSubstring
 	OpDiscordConnect
 	OpDiscordLimit
+	OpMathLoop
+	OpSysWrite
+	OpSysReadFile
+	OpSysExit
+	OpSysYield
 )
 
 type LogicOp uint8
@@ -150,6 +155,7 @@ type PacketData struct {
 	Core        int
 	Writer      io.Writer
 	LocalVars   map[string]string
+	Registers   []string
 }
 
 type Plugin interface {

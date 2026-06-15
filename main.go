@@ -14,35 +14,46 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
+	noOptimize := false
+	args := make([]string, 0, len(os.Args))
+	for _, arg := range os.Args {
+		if arg == "-fo" {
+			noOptimize = true
+			continue
+		}
+		args = append(args, arg)
+	}
+
+	if len(args) < 2 {
 		fmt.Println("SharkScript CLI")
 		fmt.Println("Usage:")
-		fmt.Println("  shs <file.shark>          Compile to .shx")
-		fmt.Println("  shs <file.shx>            Execute bytecode")
-		fmt.Println("  shs compile <file.shark>")
-		fmt.Println("  shs run <file.shx>")
-		fmt.Println("  shs aot <file.shark> [-os <target_os>]")
+		fmt.Println("  shs <file.shark>             Compile to .shx")
+		fmt.Println("  shs <file.shx>               Execute bytecode")
+		fmt.Println("  shs compile <file.shark>     Compile source")
+		fmt.Println("  shs run <file.shx>           Run VM")
+		fmt.Println("  shs aot <file.shark> [-os]   Native build")
+		fmt.Println("  -fo                          Disable auto-optimization")
 		os.Exit(1)
 	}
 
 	var mode, file string
 	var extraArgsStart int
-	arg1 := strings.TrimPrefix(os.Args[1], "--")
+	arg1 := strings.TrimPrefix(args[1], "--")
 
-	if strings.HasPrefix(os.Args[1], "--") {
-		if len(os.Args) < 3 {
-			fmt.Printf("Error: %s requires a file path\n", os.Args[1])
+	if strings.HasPrefix(args[1], "--") {
+		if len(args) < 3 {
+			fmt.Printf("Error: %s requires a file path\n", args[1])
 			os.Exit(1)
 		}
-		mode = os.Args[1]
-		file = os.Args[2]
+		mode = args[1]
+		file = args[2]
 		extraArgsStart = 3
 	} else if arg1 == "compile" || arg1 == "run" || arg1 == "aot" {
 		mode = arg1
-		file = os.Args[2]
+		file = args[2]
 		extraArgsStart = 3
 	} else {
-		file = os.Args[1]
+		file = args[1]
 		extraArgsStart = 2
 		if strings.HasSuffix(file, ".shark") {
 			mode = "compile"
@@ -54,7 +65,7 @@ func main() {
 
 	switch mode {
 	case "compile":
-		err := compiler.Compile(file)
+		err := compiler.Compile(file, noOptimize)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -63,12 +74,12 @@ func main() {
 
 	case "aot":
 		targetOS := runtime.GOOS
-		for i := 1; i < len(os.Args); i++ {
-			if os.Args[i] == "-os" && i+1 < len(os.Args) {
-				targetOS = os.Args[i+1]
+		for i := 1; i < len(args); i++ {
+			if args[i] == "-os" && i+1 < len(args) {
+				targetOS = args[i+1]
 			}
 		}
-		err := compiler.CompileAOT(file, targetOS)
+		err := compiler.CompileAOT(file, targetOS, noOptimize)
 		if err != nil {
 			fmt.Printf("AOT Error: %v\n", err)
 			os.Exit(1)
@@ -96,10 +107,10 @@ func main() {
 			os.Exit(1)
 		}
 
-		engine := vm.NewEngine(script, file)
+		engine := vm.NewEngine(script, file, noOptimize)
 
-		for i := extraArgsStart; i < len(os.Args); i++ {
-			arg := os.Args[i]
+		for i := extraArgsStart; i < len(args); i++ {
+			arg := args[i]
 			if strings.HasPrefix(arg, "--") && strings.Contains(arg, "=") {
 				kv := strings.SplitN(arg[2:], "=", 2)
 				engine.Vars[kv[0]] = kv[1]
@@ -116,7 +127,8 @@ func main() {
 		}
 
 		fmt.Printf("Executing %s...\n", file)
+		globalStart := time.Now()
 		engine.Run(pkt)
-		fmt.Println("Execution complete.")
+		fmt.Printf("Execution complete (Total Wall-Clock Time: %s).\n", time.Since(globalStart))
 	}
 }

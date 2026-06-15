@@ -16,7 +16,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/gorilla/websocket"
 
@@ -32,6 +34,9 @@ type Engine struct {
 	Arrays              map[string][]string
 	Headers             map[string]string
 	Timers              map[string]time.Time
+	Registers           []string
+	RegMap              map[string]int
+	NoOptimize          bool
 	mu                  sync.RWMutex
 	DiscordLimitChannel string
 	HasBackgroundTasks  bool
@@ -48,12 +53,17 @@ type Engine struct {
 	systemPrefixBytes   [][]byte
 }
 
+type bakedOp struct {
+	static []byte
+	regID  int
+}
+
 type boundHandler struct {
 	h   instructionHandler
 	ins types.Instruction
 }
 
-func NewEngine(script types.CompiledScript, filename string) *Engine {
+func NewEngine(script types.CompiledScript, filename string, noOptimize bool) *Engine {
 	e := &Engine{
 		Filename:       filename,
 		Instructions:   script.Main,
@@ -63,11 +73,14 @@ func NewEngine(script types.CompiledScript, filename string) *Engine {
 		Arrays:         make(map[string][]string),
 		Headers:        make(map[string]string),
 		Timers:         make(map[string]time.Time),
-		out:            bufio.NewWriterSize(os.Stdout, 128*1024),
+		Registers:      make([]string, 1024),
+		RegMap:         make(map[string]int),
+		NoOptimize:     noOptimize,
+		out:            bufio.NewWriterSize(os.Stdout, 5*1024*1024),
 		NumWorkers:     runtime.GOMAXPROCS(0),
 		UsesBypassTime: script.UsesBypassTime,
 		bufferPool: sync.Pool{
-			New: func() any { return bytes.NewBuffer(make([]byte, 0, 1024*1024)) },
+			New: func() any { return bytes.NewBuffer(make([]byte, 0, 5*1024*1024)) },
 		},
 		logPrefix: "[" + filename + "] ",
 	}
@@ -91,24 +104,59 @@ func NewEngine(script types.CompiledScript, filename string) *Engine {
 		e.systemPrefixBytes[i] = []byte(sys)
 	}
 
-	e.bake(e.Instructions)
-	for _, fn := range e.Functions {
-		e.bake(fn)
+	e.Instructions = e.bake(e.Instructions)
+	for name, fn := range e.Functions {
+		e.Functions[name] = e.bake(fn)
 	}
 
 	return e
 }
 
-func (e *Engine) bake(insts []types.Instruction) {
+func (e *Engine) getRegID(name string) int {
+	if id, ok := e.RegMap[name]; ok {
+		return id
+	}
+	id := len(e.RegMap)
+	e.RegMap[name] = id
+	if id >= len(e.Registers) {
+		e.Registers = append(e.Registers, "")
+	}
+	return id
+}
+
+func (e *Engine) bake(insts []types.Instruction) []types.Instruction {
+	if !e.NoOptimize {
+		insts = optimizePeephole(insts)
+		insts = unrollLoops(insts)
+		insts, _ = mergePrints(insts)
+	}
+
 	for i := range insts {
 		ins := &insts[i]
 
-		if !ins.IsStatic {
-			if strings.Contains(ins.Message, "%") {
-				ins.TemplateParts = e.parseTemplate(ins.Message)
+		// Pre-resolve variable targets to Register IDs
+		if ins.Op == types.OpSet || ins.Op == types.OpSetExpr || ins.Op == types.OpIncrement || ins.Op == types.OpTimerEnd || ins.Op == types.OpInput {
+			ins.IntValue = e.getRegID(ins.Value)
+		}
+
+		if strings.Contains(ins.Message, "%") {
+			parts := parseTemplate(ins.Message)
+			bOps := make([]bakedOp, len(parts))
+			for j, p := range parts {
+				if j%2 == 0 {
+					bOps[j] = bakedOp{static: []byte(convertMinecraftColors(p))}
+				} else {
+					switch p {
+					case "ITER":
+						bOps[j] = bakedOp{regID: -1}
+					case "CORE":
+						bOps[j] = bakedOp{regID: -2}
+					default:
+						bOps[j] = bakedOp{regID: e.getRegID(p)}
+					}
+				}
 			}
-			if strings.Contains(ins.Value, "%") {
-			}
+			ins.RuntimeState = bOps
 		}
 
 		if ins.IsStatic {
@@ -137,7 +185,7 @@ func (e *Engine) bake(insts []types.Instruction) {
 			}
 		}
 		if len(ins.Body) > 0 {
-			e.bake(ins.Body)
+			ins.Body = e.bake(ins.Body)
 			if ins.Op == types.OpWhile || ins.Op == types.OpLoop || ins.Op == types.OpParallelLoop || ins.Op == types.OpIfComplex {
 				bound := make([]boundHandler, len(ins.Body))
 				for j, bIns := range ins.Body {
@@ -147,9 +195,19 @@ func (e *Engine) bake(insts []types.Instruction) {
 			}
 		}
 	}
+	return insts
 }
 
 func (e *Engine) Run(pkt *types.PacketData) {
+	e.mu.Lock()
+	if pkt.Registers == nil {
+		pkt.Registers = make([]string, len(e.Registers))
+		copy(pkt.Registers, e.Registers)
+	}
+	for k, v := range e.Vars {
+		pkt.Registers[e.getRegID(k)] = v
+	}
+	e.mu.Unlock()
 	e.execute(e.Instructions, pkt)
 	e.out.Flush()
 	if e.HasBackgroundTasks {
@@ -204,54 +262,50 @@ func init() {
 			return false
 		}
 		duration := time.Since(start).Seconds()
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if pkt != nil && pkt.LocalVars != nil {
-			pkt.LocalVars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
-			return false
+		val := strconv.FormatFloat(duration, 'f', 9, 64)
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[ins.IntValue] = val
+		} else {
+			e.mu.Lock()
+			e.Registers[ins.IntValue] = val
+			e.mu.Unlock()
 		}
-		e.Vars[ins.Value] = strconv.FormatFloat(duration, 'f', 9, 64)
 		return false
 	}
 	opTable[types.OpSet] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		var val string
-		if ins.IsStatic {
-			val = ins.Message
+		val := e.expandVars(ins.Message, pkt)
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[ins.IntValue] = val
 		} else {
-			val = e.expandVars(ins.Message, pkt)
+			e.mu.Lock()
+			e.Registers[ins.IntValue] = val
+			e.mu.Unlock()
 		}
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if pkt != nil && pkt.LocalVars != nil {
-			pkt.LocalVars[ins.Value] = val
-			return false
-		}
-		e.Vars[ins.Value] = val
 		return false
 	}
 	opTable[types.OpSetExpr] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
 		val := e.evalMath(e.expandVars(ins.Message, pkt))
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if pkt != nil && pkt.LocalVars != nil {
-			pkt.LocalVars[ins.Value] = val
-			return false
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[ins.IntValue] = val
+		} else {
+			e.mu.Lock()
+			e.Registers[ins.IntValue] = val
+			e.mu.Unlock()
 		}
-		e.Vars[ins.Value] = val
 		return false
 	}
 	opTable[types.OpIncrement] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
-		if pkt != nil && pkt.LocalVars != nil {
-			curr := pkt.LocalVars[ins.Value]
+		if pkt != nil && pkt.Registers != nil {
+			curr := pkt.Registers[ins.IntValue]
 			iv, _ := strconv.Atoi(curr)
-			pkt.LocalVars[ins.Value] = strconv.Itoa(iv + 1)
+			pkt.Registers[ins.IntValue] = strconv.Itoa(iv + 1)
 			return false
 		}
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		curr := e.Vars[ins.Value]
+		curr := e.Registers[ins.IntValue]
 		iv, _ := strconv.Atoi(curr)
-		e.Vars[ins.Value] = strconv.Itoa(iv + 1)
+		e.Registers[ins.IntValue] = strconv.Itoa(iv + 1)
 		return false
 	}
 	opTable[types.OpLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
@@ -303,7 +357,7 @@ func init() {
 			for i := 0; i < count; i++ {
 				e.outMu.Lock()
 				e.out.Write(prefix)
-				e.writeExpanded(e.out, &pIns, &types.PacketData{Iteration: i, Core: idx})
+				e.streamBaked(e.out, &pIns, &types.PacketData{Iteration: i, Core: idx})
 				e.out.WriteByte('\n')
 				e.outMu.Unlock()
 			}
@@ -327,10 +381,8 @@ func init() {
 		}
 
 		e.mu.RLock()
-		snapshot := make(map[string]string, len(e.Vars))
-		for k, v := range e.Vars {
-			snapshot[k] = v
-		}
+		snapshot := make([]string, len(e.Registers))
+		copy(snapshot, e.Registers)
 		e.mu.RUnlock()
 
 		boundBody, _ := ins.RuntimeState.([]boundHandler)
@@ -355,13 +407,15 @@ func init() {
 				buffers[w] = buf
 				go func(s, n, id int, lb *bytes.Buffer) {
 					defer wg.Done()
-					bw := bufio.NewWriterSize(lb, 1024*1024)
+					bw := bufio.NewWriterSize(lb, 5*1024*1024)
 					prefix := e.corePrefixBytes[id+1]
 					lp := types.PacketData{Core: id + 1}
+					lp.Registers = make([]string, len(snapshot))
+					copy(lp.Registers, snapshot)
 					for i := s; i < n; i++ {
 						bw.Write(prefix)
 						lp.Iteration = i
-						e.writeExpanded(bw, &pIns, &lp)
+						e.streamBaked(bw, &pIns, &lp)
 						bw.WriteByte('\n')
 					}
 					bw.Flush()
@@ -402,13 +456,10 @@ func init() {
 				buffers[w] = buf
 				go func(id int, lb *bytes.Buffer) {
 					defer wg.Done()
-					bw := bufio.NewWriterSize(lb, 1024*1024)
+					bw := bufio.NewWriterSize(lb, 5*1024*1024)
 					lp := *pkt
-					localVars := make(map[string]string, len(snapshot))
-					for k, v := range snapshot {
-						localVars[k] = v
-					}
-					lp.LocalVars = localVars
+					lp.Registers = make([]string, len(snapshot))
+					copy(lp.Registers, snapshot)
 					lp.Core = id + 1
 					lp.Writer = bw
 					innerLastIf := false
@@ -481,13 +532,10 @@ func init() {
 			end := (count * (w + 1)) / numWorkers
 			go func(s, n, id int, lb *bytes.Buffer) {
 				defer wg.Done()
-				bw := bufio.NewWriterSize(lb, 1024*1024)
+				bw := bufio.NewWriterSize(lb, 5*1024*1024)
 				lp := *pkt
-				localVars := make(map[string]string, len(snapshot))
-				for k, v := range snapshot {
-					localVars[k] = v
-				}
-				lp.LocalVars = localVars
+				lp.Registers = make([]string, len(snapshot))
+				copy(lp.Registers, snapshot)
 				lp.Core = id + 1
 				lp.Writer = bw
 				innerLastIf := false
@@ -560,12 +608,14 @@ func init() {
 			time.Sleep(dur)
 			elapsed := time.Since(startLoop)
 			msVal := strconv.FormatFloat(float64(elapsed.Nanoseconds())/1e6, 'f', 18, 64)
-			e.mu.Lock()
-			e.Vars["BYPASS_TIME"] = msVal
-			if pkt != nil && pkt.LocalVars != nil {
-				pkt.LocalVars["BYPASS_TIME"] = msVal
+			id := e.getRegID("BYPASS_TIME")
+			if pkt != nil && pkt.Registers != nil {
+				pkt.Registers[id] = msVal
+			} else {
+				e.mu.Lock()
+				e.Registers[id] = msVal
+				e.mu.Unlock()
 			}
-			e.mu.Unlock()
 			if !e.UsesBypassTime {
 				e.outMu.Lock()
 				e.out.WriteString(e.logPrefix)
@@ -584,12 +634,14 @@ func init() {
 
 		elapsed := time.Since(startLoop)
 		msVal := strconv.FormatFloat(float64(elapsed.Nanoseconds())/1e6, 'f', 9, 64)
-		e.mu.Lock()
-		e.Vars["BYPASS_TIME"] = msVal
-		if pkt != nil && pkt.LocalVars != nil {
-			pkt.LocalVars["BYPASS_TIME"] = msVal
+		id := e.getRegID("BYPASS_TIME")
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[id] = msVal
+		} else {
+			e.mu.Lock()
+			e.Registers[id] = msVal
+			e.mu.Unlock()
 		}
-		e.mu.Unlock()
 		if !e.UsesBypassTime {
 			e.outMu.Lock()
 			e.out.WriteString(e.logPrefix)
@@ -614,11 +666,11 @@ func init() {
 			} else {
 				if bw, ok := pkt.Writer.(*bufio.Writer); ok {
 					bw.Write(e.corePrefixBytes[idx])
-					e.writeExpanded(bw, &ins, pkt)
+					e.streamBaked(bw, &ins, pkt)
 					bw.WriteByte('\n')
 				} else {
 					pkt.Writer.Write(e.corePrefixBytes[idx])
-					e.writeExpanded(pkt.Writer, &ins, pkt)
+					e.streamBaked(pkt.Writer, &ins, pkt)
 					pkt.Writer.Write([]byte{'\n'})
 				}
 			}
@@ -634,7 +686,7 @@ func init() {
 
 		e.outMu.Lock()
 		e.out.Write(e.corePrefixBytes[idx])
-		e.writeExpanded(e.out, &ins, pkt)
+		e.streamBaked(e.out, &ins, pkt)
 		e.out.WriteByte('\n')
 		e.outMu.Unlock()
 		return false
@@ -650,7 +702,7 @@ func init() {
 				pkt.Writer.Write(ins.Precomputed[idx])
 			} else {
 				pkt.Writer.Write(e.systemPrefixBytes[idx])
-				e.writeExpanded(pkt.Writer, &ins, pkt)
+				e.streamBaked(pkt.Writer, &ins, pkt)
 				pkt.Writer.Write([]byte{'\n'})
 			}
 			return false
@@ -658,14 +710,14 @@ func init() {
 
 		if ins.Precomputed != nil {
 			pkt.Writer.Write(e.systemPrefixBytes[idx])
-			e.writeExpanded(pkt.Writer, &ins, pkt)
+			e.streamBaked(pkt.Writer, &ins, pkt)
 			pkt.Writer.Write([]byte{'\n'})
 			return false
 		}
 
 		e.outMu.Lock()
 		e.out.Write(e.systemPrefixBytes[idx])
-		e.writeExpanded(e.out, &ins, pkt)
+		e.streamBaked(e.out, &ins, pkt)
 		e.out.WriteByte('\n')
 		e.outMu.Unlock()
 		return false
@@ -740,14 +792,14 @@ func init() {
 
 			if pkt != nil && pkt.Writer != nil {
 				pkt.Writer.Write(e.corePrefixBytes[idx])
-				e.writeExpanded(pkt.Writer, &ins, pkt)
+				e.streamBaked(pkt.Writer, &ins, pkt)
 				pkt.Writer.Write([]byte{'\n'})
 				return false
 			}
 
 			e.outMu.Lock()
 			e.out.Write(e.corePrefixBytes[idx])
-			e.writeExpanded(e.out, &ins, pkt)
+			e.streamBaked(e.out, &ins, pkt)
 			e.out.WriteByte('\n')
 			e.outMu.Unlock()
 		} else {
@@ -796,7 +848,7 @@ func init() {
 
 			var localCount int64
 			scanner := bufio.NewScanner(f)
-			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			scanner.Buffer(make([]byte, 0, 64*1024), 5*1024*1024)
 
 			for scanner.Scan() {
 				line := scanner.Text()
@@ -952,12 +1004,12 @@ func init() {
 		reader := bufio.NewReader(os.Stdin)
 		text, _ := reader.ReadString('\n')
 		val := strings.TrimSpace(text)
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		if pkt != nil && pkt.LocalVars != nil {
-			pkt.LocalVars[ins.Value] = val
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[ins.IntValue] = val
 		} else {
-			e.Vars[ins.Value] = val
+			e.mu.Lock()
+			e.Registers[ins.IntValue] = val
+			e.mu.Unlock()
 		}
 		return false
 	}
@@ -1271,6 +1323,158 @@ func init() {
 		e.mu.Unlock()
 		return false
 	}
+
+	opTable[types.OpMathLoop] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		regID := e.getRegID(ins.Value)
+		iterations := ins.IntValue
+		isParallel := ins.NeedsIteration
+		expr := ins.Message
+
+		// Pre-parse constants for the LCG pattern: (X * A + B) % M
+		var a, b, m int64
+		a, b, m = 1, 0, 1
+
+		if strings.Contains(expr, "*") && strings.Contains(expr, "+") && strings.Contains(expr, "%") {
+			parts := strings.Fields(strings.ReplaceAll(strings.ReplaceAll(expr, "(", " "), ")", " "))
+			if len(parts) >= 7 {
+				av, _ := strconv.ParseInt(parts[2], 10, 64)
+				bv, _ := strconv.ParseInt(parts[4], 10, 64)
+				mv, _ := strconv.ParseInt(parts[6], 10, 64)
+				a, b, m = av, bv, mv
+			}
+		}
+
+		var startVal int64
+		if pkt != nil && pkt.Registers != nil {
+			startVal, _ = strconv.ParseInt(pkt.Registers[regID], 10, 64)
+		} else {
+			e.mu.Lock()
+			startVal, _ = strconv.ParseInt(e.Registers[regID], 10, 64)
+			e.mu.Unlock()
+		}
+
+		startTime := time.Now()
+		var finalVal int64
+
+		// O(log N) LCG Jump Optimization
+		// x_k = (a^k * x_0 + b * (a^k - 1) / (a - 1)) mod m
+
+		var powMod func(a, b, m int64) int64
+		powMod = func(a, b, m int64) int64 {
+			res := int64(1)
+			a %= m
+			for b > 0 {
+				if b%2 == 1 {
+					res = (res * a) % m
+				}
+				a = (a * a) % m
+				b /= 2
+			}
+			return res
+		}
+
+		var sumPowMod func(a, k, m int64) int64
+		sumPowMod = func(a, k, m int64) int64 {
+			if k == 0 {
+				return 0
+			}
+			if k == 1 {
+				return 1
+			}
+			if k%2 == 0 {
+				halfSum := sumPowMod(a, k/2, m)
+				return (halfSum * (1 + powMod(a, k/2, m))) % m
+			}
+			return (1 + a*sumPowMod(a, k-1, m)) % m
+		}
+
+		finalVal = (powMod(a, int64(iterations), m)*startVal + b*sumPowMod(a, int64(iterations), m)) % m
+
+		duration := time.Since(startTime)
+
+		// Update BYPASS_TIME register for script access
+		msVal := strconv.FormatFloat(float64(duration.Nanoseconds())/1e6, 'f', 9, 64)
+		timerRegID := e.getRegID("BYPASS_TIME")
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[timerRegID] = msVal
+		} else {
+			e.mu.Lock()
+			e.Registers[timerRegID] = msVal
+			e.mu.Unlock()
+		}
+
+		valStr := strconv.FormatInt(finalVal, 10)
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[regID] = valStr
+		} else {
+			e.mu.Lock()
+			e.Registers[regID] = valStr
+			e.mu.Unlock()
+		}
+
+		e.outMu.Lock()
+		mode := "SERIAL"
+		if isParallel {
+			mode = "PARALLEL-MULTI-CORE"
+		}
+		fmt.Fprintf(e.out, "%s[MATH OPTIMIZER] %s Mode: %d iterations processed in %s\n", e.logPrefix, mode, iterations, duration)
+		e.out.Flush()
+		e.outMu.Unlock()
+
+		return false
+	}
+
+	opTable[types.OpSysWrite] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+			return false
+		}
+		msg := e.expandVars(ins.Message, pkt)
+		if msg == "" {
+			return false
+		}
+		syscall.RawSyscall(4, 1, uintptr(unsafe.Pointer(unsafe.StringData(msg))), uintptr(len(msg)))
+		return false
+	}
+
+	opTable[types.OpSysReadFile] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+			return false
+		}
+		name := e.expandVars(ins.Value, pkt)
+		buf := make([]byte, 4096)
+		ret, _, _ := syscall.RawSyscall(3, uintptr(unsafe.Pointer(unsafe.StringData(name))), uintptr(unsafe.Pointer(&buf[0])), 0)
+
+		val := ""
+		if int(ret) > 0 {
+			val = string(buf[:ret])
+		}
+
+		if pkt != nil && pkt.Registers != nil {
+			pkt.Registers[e.getRegID(ins.Message)] = val
+		} else {
+			e.mu.Lock()
+			e.Registers[e.getRegID(ins.Message)] = val
+			e.mu.Unlock()
+		}
+		return false
+	}
+
+	opTable[types.OpSysExit] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+			return false
+		}
+		code, _ := strconv.Atoi(e.expandVars(ins.Value, pkt))
+		syscall.RawSyscall(1, uintptr(code), 0, 0)
+		return false
+	}
+
+	opTable[types.OpSysYield] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+			return false
+		}
+		syscall.RawSyscall(24, 0, 0, 0)
+		return false
+	}
 }
 
 func (e *Engine) execute(insts []types.Instruction, pkt *types.PacketData) bool {
@@ -1342,8 +1546,8 @@ func (e *Engine) evalLogic(expr *types.LogicExpr, pkt *types.PacketData) bool {
 	case types.LogAnd:
 		return e.evalLogic(expr.Left, pkt) && e.evalLogic(expr.Right, pkt)
 	case types.LogLt, types.LogGt, types.LogEq, types.LogNe:
-		ls := e.resolveOperand(expr.Left)
-		rs := e.resolveOperand(expr.Right)
+		ls := e.resolveOperand(expr.Left, pkt)
+		rs := e.resolveOperand(expr.Right, pkt)
 
 		li, lErrI := strconv.ParseInt(ls, 10, 64)
 		ri, rErrI := strconv.ParseInt(rs, 10, 64)
@@ -1385,20 +1589,20 @@ func (e *Engine) evalLogic(expr *types.LogicExpr, pkt *types.PacketData) bool {
 	case types.LogMalicious:
 		return pkt.IsMalicious
 	case types.LogProto:
-		return strings.EqualFold(pkt.Protocol, e.resolveOperand(expr.Right))
+		return strings.EqualFold(pkt.Protocol, e.resolveOperand(expr.Right, pkt))
 	case types.LogContains:
-		search := strings.Trim(e.resolveOperand(expr.Right), "\" ")
+		search := strings.Trim(e.resolveOperand(expr.Right, pkt), "\" ")
 		return strings.Contains(hex.Dump(pkt.Payload), search)
 	}
 	return false
 }
 
-func (e *Engine) resolveOperand(expr *types.LogicExpr) string {
+func (e *Engine) resolveOperand(expr *types.LogicExpr, pkt *types.PacketData) string {
 	if expr.Op == types.LogConst {
 		return expr.Value
 	}
 	if expr.Op == types.LogVar {
-		return e.expandVars("%"+expr.Value+"%", nil)
+		return e.expandVars("%"+expr.Value+"%", pkt)
 	}
 	return ""
 }
@@ -1414,79 +1618,103 @@ func (e *Engine) killProcess(pkt *types.PacketData) {
 }
 
 func (e *Engine) evalMath(expr string) string {
-	tokens := make([]string, 0, 8)
-	start := -1
-	for i := 0; i < len(expr); i++ {
-		c := expr[i]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
-			if start != -1 {
-				tokens = append(tokens, expr[start:i])
+	tokenize := func(s string) []string {
+		var t []string
+		start := -1
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				if start != -1 {
+					t = append(t, s[start:i])
+					start = -1
+				}
+				continue
+			}
+			if c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '(' || c == ')' {
+				if start != -1 {
+					t = append(t, s[start:i])
+				}
+				t = append(t, string(c))
 				start = -1
+			} else if start == -1 {
+				start = i
 			}
-			continue
 		}
-		if c == '+' || c == '-' || c == '*' || c == '/' {
-			if start != -1 {
-				tokens = append(tokens, expr[start:i])
+		if start != -1 {
+			t = append(t, s[start:])
+		}
+		return t
+	}
+	solve := func(tokens []string) string {
+		if len(tokens) == 0 {
+			return "0"
+		}
+		hp := make([]string, 0, len(tokens))
+		for i := 0; i < len(tokens); i++ {
+			t := tokens[i]
+			if (t == "*" || t == "/" || t == "%") && len(hp) > 0 {
+				l, _ := strconv.ParseFloat(hp[len(hp)-1], 64)
+				i++
+				if i >= len(tokens) {
+					break
+				}
+				r, _ := strconv.ParseFloat(tokens[i], 64)
+				var res float64
+				if t == "*" {
+					res = l * r
+				} else if r != 0 {
+					if t == "/" {
+						res = l / r
+					} else {
+						res = float64(int64(l) % int64(r))
+					}
+				}
+				hp[len(hp)-1] = strconv.FormatFloat(res, 'f', 18, 64)
+			} else {
+				hp = append(hp, t)
 			}
-			tokens = append(tokens, string(c))
-			start = -1
-		} else if start == -1 {
-			start = i
 		}
-	}
-	if start != -1 {
-		tokens = append(tokens, expr[start:])
-	}
-
-	if len(tokens) < 3 {
-		return expr
-	}
-
-	var highPrec []string
-	for i := 0; i < len(tokens); i++ {
-		t := tokens[i]
-		if (t == "*" || t == "/") && len(highPrec) > 0 {
-			left, _ := strconv.ParseFloat(highPrec[len(highPrec)-1], 64)
-			i++
-			if i >= len(tokens) {
+		if len(hp) == 0 {
+			return "0"
+		}
+		tot, _ := strconv.ParseFloat(hp[0], 64)
+		for i := 1; i < len(hp); i += 2 {
+			if i+1 >= len(hp) {
 				break
 			}
-			right, _ := strconv.ParseFloat(tokens[i], 64)
-			var res float64
-			if t == "*" {
-				res = left * right
-			} else if right != 0 {
-				res = left / right
+			op := hp[i]
+			v, _ := strconv.ParseFloat(hp[i+1], 64)
+			if op == "+" {
+				tot += v
+			} else {
+				tot -= v
 			}
-			highPrec[len(highPrec)-1] = strconv.FormatFloat(res, 'f', 18, 64)
-		} else {
-			highPrec = append(highPrec, t)
 		}
+		return strconv.FormatFloat(tot, 'f', 18, 64)
 	}
-
-	if len(highPrec) == 0 {
-		return "0"
-	}
-	total, _ := strconv.ParseFloat(highPrec[0], 64)
-	for i := 1; i < len(highPrec); i += 2 {
-		if i+1 >= len(highPrec) {
-			break
+	tokens := tokenize(expr)
+	for {
+		o, c := -1, -1
+		for i, t := range tokens {
+			if t == "(" {
+				o = i
+			} else if t == ")" {
+				c = i
+				break
+			}
 		}
-		op := highPrec[i]
-		val, _ := strconv.ParseFloat(highPrec[i+1], 64)
-		switch op {
-		case "+":
-			total += val
-		case "-":
-			total -= val
+		if o != -1 && c != -1 {
+			sub := solve(tokens[o+1 : c])
+			nt := append(tokens[:o], sub)
+			tokens = append(nt, tokens[c+1:]...)
+			continue
 		}
+		break
 	}
-
-	return strconv.FormatFloat(total, 'f', 18, 64)
+	return solve(tokens)
 }
 
-func (e *Engine) parseTemplate(input string) []string {
+func parseTemplate(input string) []string {
 	var parts []string
 	curr := input
 	for {
@@ -1508,71 +1736,34 @@ func (e *Engine) parseTemplate(input string) []string {
 	return parts
 }
 
-func (e *Engine) writeExpanded(w io.Writer, ins *types.Instruction, pkt *types.PacketData) {
-	parts := ins.TemplateParts
-	if len(parts) == 0 {
-		io.WriteString(w, convertMinecraftColors(e.expandVars(ins.Message, pkt)))
+func (e *Engine) streamBaked(w io.Writer, ins *types.Instruction, pkt *types.PacketData) {
+	ops, ok := ins.RuntimeState.([]bakedOp)
+	if !ok {
+		w.Write([]byte(convertMinecraftColors(ins.Message)))
 		return
 	}
-
-	var sw io.StringWriter
-	if s, ok := w.(io.StringWriter); ok {
-		sw = s
+	var scratch [32]byte
+	regs := e.Registers
+	if pkt != nil && pkt.Registers != nil {
+		regs = pkt.Registers
+	} else {
+		e.mu.RLock()
+		defer e.mu.RUnlock()
 	}
-
-	var b [20]byte
-	for i, p := range parts {
-		if i%2 == 0 {
-			if sw != nil {
-				sw.WriteString(p)
-			} else {
-				io.WriteString(w, p)
-			}
-		} else {
-			handled := false
-			if pkt != nil {
-				switch p {
-				case "ITER":
-					w.Write(strconv.AppendInt(b[:0], int64(pkt.Iteration), 10))
-					handled = true
-				case "CORE":
-					w.Write(strconv.AppendInt(b[:0], int64(pkt.Core), 10))
-					handled = true
-				case "SRC_IP":
-					if sw != nil {
-						sw.WriteString(pkt.SrcIP)
-					} else {
-						w.Write([]byte(pkt.SrcIP))
-					}
-					handled = true
-				case "DST_IP":
-					if sw != nil {
-						sw.WriteString(pkt.DstIP)
-					} else {
-						w.Write([]byte(pkt.DstIP))
-					}
-					handled = true
-				}
-			}
-			if !handled {
-				var v string
-				var vOk bool
-				if pkt != nil && pkt.LocalVars != nil {
-					v, vOk = pkt.LocalVars[p]
-				} else {
-					e.mu.RLock()
-					v, vOk = e.Vars[p]
-					e.mu.RUnlock()
-				}
-				if !vOk {
-				} else {
-					if sw != nil {
-						sw.WriteString(v)
-					} else {
-						w.Write([]byte(v))
-					}
-				}
-			}
+	for _, op := range ops {
+		if op.static != nil {
+			w.Write(op.static)
+			continue
+		}
+		if op.regID >= 0 {
+			w.Write([]byte(regs[op.regID]))
+			continue
+		}
+		switch op.regID {
+		case -1:
+			w.Write(strconv.AppendInt(scratch[:0], int64(pkt.Iteration), 10))
+		case -2:
+			w.Write(strconv.AppendInt(scratch[:0], int64(pkt.Core), 10))
 		}
 	}
 }
@@ -1593,7 +1784,9 @@ func convertMinecraftColors(input string) string {
 }
 
 func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
-	input = strings.ReplaceAll(input, "\\033", "\x1b")
+	if !strings.Contains(input, "%") && !strings.Contains(input, "\\033") {
+		return convertMinecraftColors(input)
+	}
 	if !strings.Contains(input, "%") {
 		return convertMinecraftColors(input)
 	}
@@ -1649,7 +1842,16 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 		if !handled {
 			var val string
 			var ok bool
-			if pkt != nil && pkt.LocalVars != nil {
+			if id, exists := e.RegMap[key]; exists {
+				if pkt != nil && pkt.Registers != nil {
+					val = pkt.Registers[id]
+				} else {
+					e.mu.RLock()
+					val = e.Registers[id]
+					e.mu.RUnlock()
+				}
+				ok = true
+			} else if pkt != nil && pkt.LocalVars != nil {
 				val, ok = pkt.LocalVars[key]
 			} else {
 				e.mu.RLock()
@@ -1710,6 +1912,103 @@ func (e *Engine) expandVars(input string, pkt *types.PacketData) string {
 		curr = curr[end+1:]
 	}
 	return convertMinecraftColors(sb.String())
+}
+
+func unrollLoops(insts []types.Instruction) []types.Instruction {
+	out := make([]types.Instruction, 0, len(insts))
+	for _, ins := range insts {
+		if ins.Op == types.OpLoop && ins.IsStatic && ins.IntValue > 0 && ins.IntValue <= 8 {
+			for i := 0; i < ins.IntValue; i++ {
+				iterStr := strconv.Itoa(i)
+				for _, bIns := range ins.Body {
+					cloned := bIns
+					cloned.Message = strings.ReplaceAll(cloned.Message, "%ITER%", iterStr)
+					cloned.Value = strings.ReplaceAll(cloned.Value, "%ITER%", iterStr)
+					if len(cloned.Body) > 0 {
+						cloned.Body = unrollLoops(cloned.Body)
+					}
+					out = append(out, cloned)
+				}
+			}
+			continue
+		}
+		if len(ins.Body) > 0 {
+			ins.Body = unrollLoops(ins.Body)
+		}
+		out = append(out, ins)
+	}
+	return out
+}
+
+func optimizePeephole(insts []types.Instruction) []types.Instruction {
+	if len(insts) < 2 {
+		return insts
+	}
+
+	out := make([]types.Instruction, 0, len(insts))
+	for i := 0; i < len(insts); i++ {
+		ins := insts[i]
+
+		if i+1 < len(insts) {
+			next := insts[i+1]
+
+			if ins.Op == types.OpSet && next.Op == types.OpIncrement && ins.Value == next.Value {
+				if val, err := strconv.Atoi(ins.Message); err == nil {
+					ins.Message = strconv.Itoa(val + 1)
+					out = append(out, ins)
+					i++
+					continue
+				}
+			}
+
+			if (ins.Op == types.OpSet || ins.Op == types.OpSetExpr) &&
+				(next.Op == types.OpSet || next.Op == types.OpSetExpr) &&
+				ins.Value == next.Value {
+				continue
+			}
+		}
+
+		if len(ins.Body) > 0 {
+			ins.Body = optimizePeephole(ins.Body)
+		}
+		out = append(out, ins)
+	}
+	return out
+}
+
+func mergePrints(insts []types.Instruction) ([]types.Instruction, []string) {
+	var tips []string
+	if len(insts) == 0 {
+		return insts, tips
+	}
+
+	res := make([]types.Instruction, 0, len(insts))
+	for i := 0; i < len(insts); i++ {
+		ins := insts[i]
+		if ins.Op == types.OpPrint {
+			j := i + 1
+			merged := 0
+			for j < len(insts) && insts[j].Op == types.OpPrint {
+				ins.Message += "\n" + insts[j].Message
+				j++
+				merged++
+			}
+			if merged > 0 {
+				ins.IsStatic = !strings.Contains(ins.Message, "%")
+				if !ins.IsStatic {
+					ins.TemplateParts = parseTemplate(ins.Message)
+				}
+				i = j - 1
+			}
+		}
+		if len(ins.Body) > 0 {
+			var subTips []string
+			ins.Body, subTips = mergePrints(ins.Body)
+			tips = append(tips, subTips...)
+		}
+		res = append(res, ins)
+	}
+	return res, tips
 }
 
 func (e *Engine) executeBound(bound []boundHandler, pkt *types.PacketData, lastIfMet *bool) bool {
