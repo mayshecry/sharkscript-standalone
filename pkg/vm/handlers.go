@@ -1137,7 +1137,7 @@ func init() {
 		isParallel := ins.NeedsIteration
 		expr := ins.Message
 
-		// Pre-parse constants for the LCG pattern: (X * A + B) % M
+
 		var a, b, m int64
 		a, b, m = 1, 0, 1
 
@@ -1163,8 +1163,7 @@ func init() {
 		startTime := time.Now()
 		var finalVal int64
 
-		// O(log N) LCG Jump Optimization
-		// x_k = (a^k * x_0 + b * (a^k - 1) / (a - 1)) mod m
+
 
 		var powMod func(a, b, m int64) int64
 		powMod = func(a, b, m int64) int64 {
@@ -1199,7 +1198,7 @@ func init() {
 
 		duration := time.Since(startTime)
 
-		// Update BYPASS_TIME register for script access
+
 		msVal := strconv.FormatFloat(float64(duration.Nanoseconds())/1e6, 'f', 9, 64)
 		timerRegID := e.getRegID("BYPASS_TIME")
 		if pkt != nil && pkt.Registers != nil {
