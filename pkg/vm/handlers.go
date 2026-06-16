@@ -1282,4 +1282,93 @@ func init() {
 		syscall.RawSyscall(24, 0, 0, 0)
 		return false
 	}
+
+	opTable[types.OpReplace] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		src := e.expandVars(ins.Value, pkt)
+		parts := strings.SplitN(ins.Message, "|", 3)
+		if len(parts) < 3 {
+			return false
+		}
+		search := e.expandVars(parts[0], pkt)
+		replace := e.expandVars(parts[1], pkt)
+		target := parts[2]
+		val := strings.ReplaceAll(src, search, replace)
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[target] = val
+		} else {
+			e.Vars[target] = val
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpListFiles] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		path := e.expandVars(ins.Value, pkt)
+		entries, err := os.ReadDir(path)
+		var files []string
+		if err == nil {
+			for _, entry := range entries {
+				files = append(files, entry.Name())
+			}
+		}
+		e.mu.Lock()
+		e.Arrays[ins.Message] = files
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpFileExists] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		path := e.expandVars(ins.Value, pkt)
+		_, err := os.Stat(path)
+		exists := "true"
+		if os.IsNotExist(err) {
+			exists = "false"
+		}
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Message] = exists
+		} else {
+			e.Vars[ins.Message] = exists
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpGetEnv] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		key := e.expandVars(ins.Value, pkt)
+		val := os.Getenv(key)
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Message] = val
+		} else {
+			e.Vars[ins.Message] = val
+		}
+		e.mu.Unlock()
+		return false
+	}
+
+	opTable[types.OpGetHardware] = func(e *Engine, ins types.Instruction, pkt *types.PacketData, lastIfMet *bool) bool {
+		info := struct {
+			OS       string `json:"os"`
+			Arch     string `json:"arch"`
+			CPUs     int    `json:"cpus"`
+			Hostname string `json:"hostname"`
+		}{
+			OS:   runtime.GOOS,
+			Arch: runtime.GOARCH,
+			CPUs: runtime.NumCPU(),
+		}
+		info.Hostname, _ = os.Hostname()
+		b, _ := json.Marshal(info)
+		val := string(b)
+		e.mu.Lock()
+		if pkt != nil && pkt.LocalVars != nil {
+			pkt.LocalVars[ins.Message] = val
+		} else {
+			e.Vars[ins.Message] = val
+		}
+		e.mu.Unlock()
+		return false
+	}
 }

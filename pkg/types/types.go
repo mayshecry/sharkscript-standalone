@@ -78,6 +78,11 @@ const (
 	OpSysReadFile
 	OpSysExit
 	OpSysYield
+	OpReplace
+	OpListFiles
+	OpFileExists
+	OpGetEnv
+	OpGetHardware
 )
 
 type LogicOp uint8

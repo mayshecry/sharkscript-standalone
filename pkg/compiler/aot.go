@@ -86,8 +86,11 @@ func GenerateGo(script types.CompiledScript) string {
 				required["io"] = true
 				required["strings"] = true
 				needsExpandVars = true
-			case types.OpJsonExtract:
+			case types.OpJsonExtract, types.OpGetHardware:
 				required["encoding/json"] = true
+				if ins.Op == types.OpGetHardware {
+					required["runtime"] = true
+				}
 				required["fmt"] = true
 				needsExpandVars = true
 			case types.OpDiscordConnect:
@@ -97,7 +100,11 @@ func GenerateGo(script types.CompiledScript) string {
 				needsExpandVars = true
 			case types.OpSetHeader:
 				needsExpandVars = true
-			case types.OpSubstring:
+			case types.OpSubstring, types.OpReplace:
+				required["strings"] = true
+				needsExpandVars = true
+			case types.OpListFiles, types.OpFileExists, types.OpGetEnv:
+				required["os"] = true
 				needsExpandVars = true
 			case types.OpSleep:
 				required["time"] = true
@@ -130,9 +137,34 @@ func GenerateGo(script types.CompiledScript) string {
 			if ins.Op == types.OpEmptyParallelLoop || ins.Op == types.OpMathLoop {
 				getRegID("BYPASS_TIME")
 			}
-			if ins.Value != "" && (ins.Op == types.OpSet || ins.Op == types.OpSetExpr || ins.Op == types.OpIncrement || ins.Op == types.OpTimerEnd || ins.Op == types.OpInput || ins.Op == types.OpFetch || ins.Op == types.OpPost || ins.Op == types.OpPut || ins.Op == types.OpPatch || ins.Op == types.OpDelete || ins.Op == types.OpJsonExtract || ins.Op == types.OpReadFile || ins.Op == types.OpSubstring || ins.Op == types.OpArrayGet || ins.Op == types.OpArrayLen || ins.Op == types.OpIndexOf) {
-				getRegID(ins.Value)
+
+			// Correctly identify register targets based on the specific OpCode structure
+			switch ins.Op {
+			case types.OpSet, types.OpSetExpr, types.OpIncrement, types.OpTimerEnd, types.OpInput, types.OpArrayLen:
+				if ins.Value != "" {
+					getRegID(ins.Value)
+				}
+			case types.OpFileExists, types.OpGetEnv, types.OpReadFile, types.OpFetch, types.OpGetHardware:
+				if ins.Message != "" {
+					getRegID(ins.Message)
+				}
+			case types.OpSubstring, types.OpReplace:
+				parts := strings.SplitN(ins.Message, "|", 3)
+				if len(parts) == 3 {
+					getRegID(parts[2])
+				}
+			case types.OpJsonExtract, types.OpArrayGet, types.OpIndexOf:
+				parts := strings.SplitN(ins.Message, "|", 2)
+				if len(parts) == 2 {
+					getRegID(parts[1])
+				}
+			case types.OpPost, types.OpPut, types.OpPatch, types.OpDelete:
+				parts := strings.SplitN(ins.Message, "|", 2)
+				if len(parts) > 0 {
+					getRegID(parts[0])
+				}
 			}
+
 			if strings.Contains(ins.Message, "%") {
 				parts := parseTemplate(ins.Message)
 				for i := 1; i < len(parts); i += 2 {
@@ -820,6 +852,45 @@ func translateToGo(ins types.Instruction, depth int, inLoop bool, regMap map[str
 	case types.OpSysYield:
 		res := fmt.Sprintf("%sif runtime.GOOS != \"linux\" && runtime.GOOS != \"windows\" {\n", indent)
 		res += fmt.Sprintf("%s\tsyscall.RawSyscall(24, 0, 0, 0)\n", indent)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpReplace:
+		parts := strings.SplitN(ins.Message, "|", 3)
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\tsrc := expandVars(%q, vars, pkt)\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tsearch := expandVars(%q, vars, pkt)\n", indent, parts[0])
+		res += fmt.Sprintf("%s\treplace := expandVars(%q, vars, pkt)\n", indent, parts[1])
+		res += fmt.Sprintf("%s\tvars[regMap[%q]] = strings.ReplaceAll(src, search, replace)\n", indent, parts[2])
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpListFiles:
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\tentries, _ := os.ReadDir(expandVars(%q, vars, pkt))\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tvar files []string\n", indent)
+		res += fmt.Sprintf("%s\tfor _, entry := range entries { files = append(files, entry.Name()) }\n", indent)
+		res += fmt.Sprintf("%s\tarrays[%q] = files\n", indent, ins.Message)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpFileExists:
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\t_, err := os.Stat(expandVars(%q, vars, pkt))\n", indent, ins.Value)
+		res += fmt.Sprintf("%s\tvars[regMap[%q]] = \"true\"\n", indent, ins.Message)
+		res += fmt.Sprintf("%s\tif os.IsNotExist(err) { vars[regMap[%q]] = \"false\" }\n", indent, ins.Message)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpGetEnv:
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\tvars[regMap[%q]] = os.Getenv(expandVars(%q, vars, pkt))\n", indent, ins.Message, ins.Value)
+		res += fmt.Sprintf("%s}\n", indent)
+		return res
+	case types.OpGetHardware:
+		res := fmt.Sprintf("%s{\n", indent)
+		res += fmt.Sprintf("%s\tinfo := struct { OS string `json:\"os\"`; Arch string `json:\"arch\"`; CPUs int `json:\"cpus\"`; Hostname string `json:\"hostname\"` }{\n", indent)
+		res += fmt.Sprintf("%s\t\tOS: runtime.GOOS, Arch: runtime.GOARCH, CPUs: runtime.NumCPU(),\n", indent)
+		res += fmt.Sprintf("%s\t}\n", indent)
+		res += fmt.Sprintf("%s\tinfo.Hostname, _ = os.Hostname()\n", indent)
+		res += fmt.Sprintf("%s\tb, _ := json.Marshal(info)\n", indent)
+		res += fmt.Sprintf("%s\tvars[regMap[%q]] = string(b)\n", indent, ins.Message)
 		res += fmt.Sprintf("%s}\n", indent)
 		return res
 	default:

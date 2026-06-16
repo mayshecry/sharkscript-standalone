@@ -637,6 +637,40 @@ func Parse(srcPath string, noOptimize bool) (types.CompiledScript, int, []string
 			ins.Op = types.OpSysYield
 		case "BashKILL_PID":
 			ins.Op = types.OpBashKill
+		case "REPLACE":
+			if len(parts) < 5 {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: REPLACE requires source, search, replace, and target_var", lineNum)
+			}
+			ins.Op = types.OpReplace
+			ins.Value = parts[1]
+			ins.Message = parts[2] + "|" + parts[3] + "|" + parts[4]
+		case "LIST_FILES":
+			if len(parts) < 3 {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: LIST_FILES requires path and target_array", lineNum)
+			}
+			ins.Op = types.OpListFiles
+			ins.Value = parts[1]
+			ins.Message = parts[2]
+		case "FILE_EXISTS":
+			if len(parts) < 3 {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: FILE_EXISTS requires path and target_var", lineNum)
+			}
+			ins.Op = types.OpFileExists
+			ins.Value = parts[1]
+			ins.Message = parts[2]
+		case "GET_ENV":
+			if len(parts) < 3 {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: GET_ENV requires key and target_var", lineNum)
+			}
+			ins.Op = types.OpGetEnv
+			ins.Value = parts[1]
+			ins.Message = parts[2]
+		case "GET_HARDWARE":
+			if len(parts) < 2 {
+				return types.CompiledScript{}, lineNum, nil, fmt.Errorf("line %d: GET_HARDWARE requires a target variable", lineNum)
+			}
+			ins.Op = types.OpGetHardware
+			ins.Message = parts[1]
 		default:
 			if strings.HasPrefix(parts[0], "%") && len(parts) >= 3 && parts[1] == "=" {
 				varName := strings.Trim(parts[0], "%")
