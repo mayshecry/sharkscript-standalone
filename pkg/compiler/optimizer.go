@@ -42,14 +42,10 @@ func optimizePeephole(insts []types.Instruction) []types.Instruction {
 	out := make([]types.Instruction, 0, len(insts))
 	for i := 0; i < len(insts); i++ {
 		ins := insts[i]
-
-		// Detect Math Loop Pattern: [PARALLEL] LOOP N { %X% = (%X% * A + B) % M }
 		if (ins.Op == types.OpLoop || ins.Op == types.OpParallelLoop) && len(ins.Body) == 1 {
 			isParallel := ins.Op == types.OpParallelLoop
 			body := ins.Body[0]
 			if body.Op == types.OpSetExpr && strings.Contains(body.Message, "%"+ins.Value+"%") {
-				// Basic detection for LCG-style math loops
-				// We transform this into a single OpMathLoop instruction
 				count, _ := strconv.Atoi(ins.Value)
 				if count == 0 {
 					count = ins.IntValue
@@ -57,11 +53,11 @@ func optimizePeephole(insts []types.Instruction) []types.Instruction {
 
 				newIns := types.Instruction{
 					Op:             types.OpMathLoop,
-					Value:          body.Value,   // The variable being modified
-					Message:        body.Message, // The raw expression
+					Value:          body.Value,   
+					Message:        body.Message, 
 					IntValue:       count,
 					IsStatic:       true,
-					NeedsIteration: isParallel, // Flag for parallel execution
+					NeedsIteration: isParallel, 
 				}
 				out = append(out, newIns)
 				continue
