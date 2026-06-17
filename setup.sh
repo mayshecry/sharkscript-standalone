@@ -40,7 +40,7 @@ echo "Setup Complete!"
 echo "You can now use 'shs --compile' or 'shs --run'"
 echo "------------------------------------------------"
 
-# Verify installation
+
 if command -v shs &> /dev/null; then
     echo "Verification: shs is active."
 else
