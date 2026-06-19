@@ -1,9 +1,7 @@
 @echo off
 SETLOCAL EnableDelayedExpansion
 
-:: --- Helper function to append to system PATH ---
-:: This function safely appends a directory to the system-wide PATH environment variable.
-:: It checks if the entry already exists to prevent duplicates.
+
 :: Usage: CALL :AppendToSystemPath "C:\path\to\add"
 :AppendToSystemPath
     SET "NEW_PATH_ENTRY=%~1"
